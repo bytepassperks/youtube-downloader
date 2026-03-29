@@ -19,6 +19,7 @@ aiofiles = "^25.1.0"
 python-dotenv = "^1.2.2"
 b2sdk = "^2.10.4"
 bcrypt = "4.0.1"
+pycryptodome = "^3.23.0"
 
 
 [build-system]

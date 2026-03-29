@@ -1,308 +1,384 @@
+"""Mega downloader with Mega API-based quota bypass.
+
+Instead of using megadl CLI (which downloads entire folders as a single session
+and fails completely on 509 quota errors), this module uses Mega's HTTP API
+directly to:
+1. List all files in a shared folder
+2. Get individual download URLs per file
+3. Download and decrypt each file independently
+4. Rotate proxies per-file when hitting 509 quota errors
+
+This is the same technique used by MegaBasterd and MegaDownloader.exe:
+- Mega's quota is per-IP, resetting when IP changes
+- By rotating proxies/IPs between files, we can download unlimited data
+- Each file download uses a fresh IP if the previous one was quota-limited
+"""
+
 import os
-import subprocess
 import shutil
 import json
-import re
+import struct
+import base64
 import time
+import sys
+import requests
 from typing import Optional
+from Crypto.Cipher import AES
+from Crypto.Util import Counter as CryptoCounter
 
 from app.database import get_connection
 
 
-# Number of parallel download workers (for future use with file-level parallelism)
+# Configuration
 DOWNLOAD_WORKERS = int(os.getenv("DOWNLOAD_WORKERS", "3"))
-
-# Render API for service restart (IP rotation)
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 
 
-def _ensure_megatools():
-    """Ensure megatools (megadl) is installed. Install if missing."""
+# --- Mega Crypto Helpers ------------------------------------------------
+
+def _b64_decode(data: str) -> bytes:
+    data += '==' if len(data) % 4 == 2 else '=' if len(data) % 4 == 3 else ''
+    return base64.urlsafe_b64decode(data)
+
+
+def _str_to_a32(b) -> tuple:
+    if isinstance(b, str):
+        b = b.encode()
+    if len(b) % 4:
+        b += b'\0' * (4 - len(b) % 4)
+    return struct.unpack('>%dI' % (len(b) // 4), b)
+
+
+def _a32_to_str(a) -> bytes:
+    return struct.pack('>%dI' % len(a), *a)
+
+
+def _decrypt_attr(attr_data: bytes, key: tuple) -> Optional[dict]:
     try:
-        subprocess.run(["megadl", "--version"], capture_output=True, timeout=5)
-        return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        cipher = AES.new(_a32_to_str(key), AES.MODE_CBC, b'\0' * 16)
+        decrypted = cipher.decrypt(attr_data).decode('utf-8', errors='ignore')
+        if 'MEGA{' in decrypted:
+            json_str = decrypted[decrypted.index('MEGA{') + 4:]
+            brace_count = 0
+            for i, c in enumerate(json_str):
+                if c == '{':
+                    brace_count += 1
+                elif c == '}':
+                    brace_count -= 1
+                if brace_count == 0:
+                    return json.loads(json_str[:i + 1])
+    except Exception:
         pass
+    return None
 
-    # Try installing megatools
-    print("megadl not found, attempting to install megatools...")
+
+def _decrypt_node_key(encrypted_key_b64: str, folder_key: tuple) -> tuple:
+    encrypted_key = _b64_decode(encrypted_key_b64)
+    key_a32 = _str_to_a32(encrypted_key)
+    if len(key_a32) == 4:
+        return tuple(a ^ b for a, b in zip(key_a32, folder_key))
+    elif len(key_a32) == 8:
+        cipher = AES.new(_a32_to_str(folder_key), AES.MODE_ECB)
+        decrypted = cipher.decrypt(_a32_to_str(key_a32[:4])) + \
+                    cipher.decrypt(_a32_to_str(key_a32[4:]))
+        return _str_to_a32(decrypted)
+    return key_a32
+
+
+def _get_file_key(node_key: tuple) -> tuple:
+    if len(node_key) == 8:
+        return (node_key[0] ^ node_key[4], node_key[1] ^ node_key[5],
+                node_key[2] ^ node_key[6], node_key[3] ^ node_key[7])
+    return node_key
+
+
+def _get_file_iv(node_key: tuple) -> tuple:
+    if len(node_key) >= 6:
+        return (node_key[4], node_key[5], 0, 0)
+    return (0, 0, 0, 0)
+
+
+# --- Mega API -----------------------------------------------------------
+
+def _mega_api_request(data: dict, folder_id: str = None,
+                      proxy: str = None, timeout: int = 30):
+    params = {'id': 1}
+    if folder_id:
+        params['n'] = folder_id
+    url = 'https://g.api.mega.co.nz/cs'
+    proxies = {'http': proxy, 'https': proxy} if proxy else None
+    resp = requests.post(url, params=params, data=json.dumps([data]),
+                         proxies=proxies, timeout=timeout)
+    result = resp.json()
+    if isinstance(result, list) and len(result) > 0:
+        return result[0]
+    return result
+
+
+def _parse_folder_link(mega_link: str) -> tuple:
+    if '/folder/' in mega_link:
+        parts = mega_link.split('#')
+        folder_id = parts[0].split('/')[-1]
+        folder_key_b64 = parts[1] if len(parts) > 1 else ''
+    elif '#F!' in mega_link:
+        parts = mega_link.split('!')
+        folder_id = parts[1] if len(parts) > 1 else ''
+        folder_key_b64 = parts[2] if len(parts) > 2 else ''
+    else:
+        raise ValueError(f"Unsupported Mega link format: {mega_link}")
+    folder_key = _str_to_a32(_b64_decode(folder_key_b64))
+    return folder_id, folder_key
+
+
+def _list_folder_files(folder_id: str, folder_key: tuple) -> list:
+    result = _mega_api_request({'a': 'f', 'c': 1, 'r': 1, 'ca': 1},
+                               folder_id=folder_id)
+    if isinstance(result, int):
+        raise Exception(f"Mega API error {result} when listing folder")
+
+    raw_nodes = result.get('f', [])
+    nodes = {}
+
+    for f in raw_nodes:
+        h = f['h']
+        t = f['t']
+        p = f.get('p', '')
+        key_str = f.get('k', '')
+        if ':' in key_str:
+            key_str = key_str.split(':')[1]
+        try:
+            node_key = _decrypt_node_key(key_str, folder_key)
+            file_key = _get_file_key(node_key) if t == 0 else node_key
+            attr_data = _b64_decode(f.get('a', ''))
+            attrs = _decrypt_attr(attr_data, file_key)
+            name = attrs.get('n', f'file_{h}') if attrs else f'file_{h}'
+        except Exception:
+            name = f'file_{h}'
+            node_key = None
+            file_key = None
+
+        nodes[h] = {
+            'handle': h, 'parent': p, 'type': t, 'name': name,
+            'size': f.get('s', 0), 'node_key': node_key, 'file_key': file_key,
+        }
+
+    # Find root
+    root_handle = None
+    for h, n in nodes.items():
+        if n['type'] in (1, 2) and n['parent'] not in nodes:
+            root_handle = h
+            break
+
+    def get_path(h):
+        parts = []
+        current = h
+        while current and current != root_handle and current in nodes:
+            parts.append(nodes[current]['name'])
+            current = nodes[current]['parent']
+        parts.reverse()
+        return '/'.join(parts)
+
+    files = []
+    for h, n in nodes.items():
+        if n['type'] == 0 and n['node_key'] is not None:
+            files.append({
+                'handle': h, 'name': n['name'], 'size': n['size'],
+                'path': get_path(h), 'node_key': n['node_key'],
+                'file_key': n['file_key'],
+            })
+    return files
+
+
+# --- File Download & Decryption ----------------------------------------
+
+def _get_download_url(file_handle: str, folder_id: str,
+                      proxy: str = None) -> Optional[str]:
     try:
-        subprocess.run(
-            ["apt-get", "update", "-qq"],
-            capture_output=True, timeout=60,
+        result = _mega_api_request(
+            {'a': 'g', 'g': 1, 'n': file_handle},
+            folder_id=folder_id, proxy=proxy, timeout=30,
         )
-        result = subprocess.run(
-            ["apt-get", "install", "-y", "-qq", "megatools"],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0:
-            print("megatools installed successfully")
-            return True
-        print(f"apt-get install failed: {result.stderr}")
+        if isinstance(result, int):
+            print(f"[MegaAPI] Error {result} getting URL for {file_handle}")
+            return None
+        if isinstance(result, dict) and 'g' in result:
+            return result['g']
+        print(f"[MegaAPI] Unexpected response for {file_handle}: {result}")
+        return None
     except Exception as e:
-        print(f"Failed to install megatools via apt: {e}")
+        print(f"[MegaAPI] Exception getting URL for {file_handle}: {e}")
+        return None
 
-    # Try downloading a static binary as fallback
+
+def _download_and_decrypt_file(
+    dl_url: str, dest_path: str, file_key: tuple, node_key: tuple,
+    file_size: int, proxy: str = None, timeout: int = 3600,
+) -> bool:
     try:
-        print("Trying static binary download...")
-        subprocess.run(
-            ["wget", "-q", "-O", "/usr/local/bin/megadl",
-             "https://megatools.megous.com/builds/builds/megatools-1.11.1.20230212-linux-x86_64/megadl"],
-            capture_output=True, timeout=30,
-        )
-        subprocess.run(["chmod", "+x", "/usr/local/bin/megadl"], capture_output=True)
-        result = subprocess.run(["megadl", "--version"], capture_output=True, timeout=5)
-        if result.returncode == 0:
-            print("megadl static binary installed successfully")
-            return True
+        proxies = {'http': proxy, 'https': proxy} if proxy else None
+        resp = requests.get(dl_url, stream=True, proxies=proxies,
+                            timeout=(30, timeout))
+        if resp.status_code == 509:
+            print(f"[Download] 509 over quota from download server")
+            return False
+        if resp.status_code != 200:
+            print(f"[Download] HTTP {resp.status_code} from download server")
+            return False
+
+        iv = _get_file_iv(node_key)
+        initial_value = int.from_bytes(_a32_to_str(iv), 'big')
+        ctr = CryptoCounter.new(128, initial_value=initial_value)
+        cipher = AES.new(_a32_to_str(file_key), AES.MODE_CTR, counter=ctr)
+
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+        downloaded = 0
+        with open(dest_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if chunk:
+                    f.write(cipher.decrypt(chunk))
+                    downloaded += len(chunk)
+
+        # Trim to actual size (Mega pads to AES block boundary)
+        if file_size > 0 and downloaded > file_size:
+            with open(dest_path, 'r+b') as f:
+                f.truncate(file_size)
+        return True
+    except requests.exceptions.ConnectionError as e:
+        print(f"[Download] Connection error: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print(f"[Download] Timeout")
+        return False
     except Exception as e:
-        print(f"Static binary fallback failed: {e}")
+        print(f"[Download] Error: {e}")
+        return False
 
-    return False
 
+# --- Proxy / IP Rotation -----------------------------------------------
 
-def _get_proxy_list() -> list[str]:
-    """Get list of SOCKS5/HTTP proxy URLs from env var.
-
-    Format: comma-separated proxy URLs
-    e.g. MEGA_PROXIES=socks5://1.2.3.4:1080,socks5://5.6.7.8:1080
-    """
+def _get_proxy_list() -> list:
     proxies_str = os.getenv("MEGA_PROXIES", "")
     if not proxies_str.strip():
         return []
     return [p.strip() for p in proxies_str.split(",") if p.strip()]
 
 
-def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
-                         max_retries: int = 3, timeout: int = 7200) -> bool:
-    """Download from Mega with retry logic and optional proxy.
-
-    Returns True on success, False if throttled/failed after retries.
-    Uses Popen to stream megadl output live to logs for visibility.
-    Handles 'file already exists' by cleaning up partial downloads before retry.
-    Detects 0 bytes/s stall and aborts early to try next proxy.
-    """
-    import sys
-
-    for attempt in range(max_retries):
-        try:
-            cmd = ["megadl", mega_link, "--path", download_path]
-            if proxy:
-                cmd.extend(["--proxy", proxy])
-
-            print(f"[Download] Attempt {attempt + 1}/{max_retries}, proxy={proxy or 'direct'}")
-            print(f"[Download] Command: {' '.join(cmd[:3])}... --path {download_path}")
-            sys.stdout.flush()
-
-            # Use Popen to stream output live instead of capturing silently
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-
-            output_lines = []
-            start_time = time.time()
-            last_log_time = start_time
-            zero_speed_count = 0
-            has_file_exists_error = False
-
-            # Read output line by line, streaming to stdout
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    output_lines.append(line)
-
-                    # Detect "file already exists" error
-                    if "file already exists" in line.lower():
-                        has_file_exists_error = True
-
-                    # Detect stalled download (0 bytes/s repeatedly)
-                    if "0 bytes/s" in line and "0.00%" in line:
-                        zero_speed_count += 1
-                        if zero_speed_count >= 5:
-                            print(f"[Download] Stalled at 0 bytes/s for {zero_speed_count} checks, aborting")
-                            sys.stdout.flush()
-                            proc.kill()
-                            break
-
-                    # Log every line but also periodic progress
-                    now = time.time()
-                    if now - last_log_time >= 30 or len(output_lines) <= 10:
-                        print(f"[megadl] {line}")
-                        sys.stdout.flush()
-                        last_log_time = now
-
-                # Check timeout
-                if time.time() - start_time > timeout:
-                    proc.kill()
-                    print(f"[Download] Timeout after {timeout}s")
-                    sys.stdout.flush()
-                    break
-
-            proc.wait(timeout=60)
-            output = "\n".join(output_lines)
-            elapsed = int(time.time() - start_time)
-            print(f"[Download] Process exited with code {proc.returncode} after {elapsed}s, {len(output_lines)} lines output")
-            sys.stdout.flush()
-
-            # If we got "file already exists" errors, clean up and retry
-            if has_file_exists_error and proc.returncode != 0:
-                print(f"[Download] Cleaning up existing files in {download_path} for fresh download")
-                sys.stdout.flush()
-                if os.path.exists(download_path):
-                    shutil.rmtree(download_path)
-                    os.makedirs(download_path, exist_ok=True)
-                if attempt < max_retries - 1:
-                    continue
-
-            # Check for success
-            if proc.returncode == 0:
-                print(f"[Download] Success with proxy={proxy or 'direct'}")
-                sys.stdout.flush()
-                return True
-
-            # If stalled at 0 bytes/s, treat as throttled
-            if zero_speed_count >= 5:
-                print(f"[Download] Treated as throttled (stalled at 0 bytes/s)")
-                sys.stdout.flush()
-                # Clean up partial files before trying next proxy
-                if os.path.exists(download_path):
-                    shutil.rmtree(download_path)
-                    os.makedirs(download_path, exist_ok=True)
-                return False  # Return False immediately to try next proxy
-
-            # Check for quota/bandwidth limit errors
-            throttle_indicators = [
-                "bandwidth limit",
-                "over quota",
-                "temporarily unavailable",
-                "too many connections",
-                "509",
-                "rate limit",
-            ]
-            is_throttled = any(ind in output.lower() for ind in throttle_indicators)
-
-            if is_throttled:
-                print(f"[Download] Throttled on attempt {attempt + 1}, proxy={proxy or 'direct'}")
-                sys.stdout.flush()
-                # Clean up partial files
-                if os.path.exists(download_path):
-                    shutil.rmtree(download_path)
-                    os.makedirs(download_path, exist_ok=True)
-                if attempt < max_retries - 1:
-                    wait_time = 10 * (attempt + 1)
-                    print(f"[Download] Waiting {wait_time}s before retry...")
-                    sys.stdout.flush()
-                    time.sleep(wait_time)
-                continue
-
-            # Non-throttle error - print last few lines for debugging
-            last_output = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
-            print(f"[Download] Error (last 10 lines): {last_output}")
-            sys.stdout.flush()
-            if attempt < max_retries - 1:
-                time.sleep(5)
-                continue
-
-        except subprocess.TimeoutExpired:
-            print(f"[Download] Timeout on attempt {attempt + 1}")
-            sys.stdout.flush()
-            if attempt < max_retries - 1:
-                continue
-        except Exception as e:
-            print(f"[Download] Unexpected error: {e}")
-            sys.stdout.flush()
-            if attempt < max_retries - 1:
-                time.sleep(5)
-                continue
-
-    return False
-
-
-def _trigger_render_restart():
-    """Restart the Render service to get a fresh IP address.
-
-    Used as a last resort when Mega is throttling the direct connection.
-    """
+def _trigger_render_restart() -> bool:
     if not RENDER_API_KEY or not RENDER_SERVICE_ID:
-        print("[IP Rotation] Render API key or service ID not configured, skipping restart")
+        print("[IP Rotation] Render API key or service ID not configured")
         return False
-
     try:
         import urllib.request
-
         url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys"
         data = json.dumps({"clearCache": "do_not_clear"}).encode()
         req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Authorization": f"Bearer {RENDER_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            url, data=data,
+            headers={"Authorization": f"Bearer {RENDER_API_KEY}",
+                     "Content-Type": "application/json"},
             method="POST",
         )
-
         response = urllib.request.urlopen(req, timeout=30)
         if response.status in (200, 201):
-            print("[IP Rotation] Render service restart triggered successfully")
+            print("[IP Rotation] Render restart triggered")
             return True
-        else:
-            print(f"[IP Rotation] Render restart returned status {response.status}")
-            return False
+        print(f"[IP Rotation] Render restart returned {response.status}")
+        return False
     except Exception as e:
-        print(f"[IP Rotation] Failed to trigger Render restart: {e}")
+        print(f"[IP Rotation] Render restart failed: {e}")
         return False
 
 
-class MegaDownloader:
-    """Downloads files from Mega.nz public folder links using megadl CLI.
+class ProxyRotator:
+    """Manages proxy rotation for quota bypass."""
 
-    Speed optimizations:
-    - Proxy rotation: megadl --proxy socks5://... for IP rotation when throttled
-    - Render auto-restart: triggers service restart for fresh IP as fallback
-    - Resumable downloads: megadl resumes by default after restarts
-    - Retry with backoff: automatic retries with exponential backoff
+    def __init__(self, proxies: list):
+        self.proxies = proxies
+        self.current_index = -1  # -1 = direct (no proxy)
+        self.exhausted: set = set()
+        self.direct_exhausted = False
+
+    def get_current_proxy(self) -> Optional[str]:
+        if self.current_index < 0:
+            return None
+        if self.current_index < len(self.proxies):
+            return self.proxies[self.current_index]
+        return None
+
+    def mark_exhausted(self):
+        proxy = self.get_current_proxy()
+        if proxy is None:
+            self.direct_exhausted = True
+            print("[ProxyRotator] Direct connection quota exhausted")
+        else:
+            self.exhausted.add(proxy)
+            print(f"[ProxyRotator] Proxy exhausted: {proxy}")
+
+    def rotate(self) -> bool:
+        start = self.current_index
+        for _ in range(len(self.proxies) + 2):
+            self.current_index += 1
+            if self.current_index >= len(self.proxies):
+                self.current_index = -1
+            proxy = self.get_current_proxy()
+            if proxy is None and not self.direct_exhausted:
+                print("[ProxyRotator] Rotated to direct connection")
+                return True
+            if proxy is not None and proxy not in self.exhausted:
+                print(f"[ProxyRotator] Rotated to proxy: {proxy}")
+                return True
+            if self.current_index == start:
+                break
+        print("[ProxyRotator] All proxies exhausted")
+        return False
+
+    def all_exhausted(self) -> bool:
+        return self.direct_exhausted and len(self.exhausted) >= len(self.proxies)
+
+    def reset(self):
+        self.exhausted.clear()
+        self.direct_exhausted = False
+        self.current_index = -1
+        print("[ProxyRotator] All proxies reset")
+
+
+# --- Main Downloader Class ---------------------------------------------
+
+class MegaDownloader:
+    """Downloads files from Mega.nz public folder links.
+
+    Uses Mega's HTTP API directly (not megadl CLI) for per-file proxy
+    rotation, enabling unlimited downloads by bypassing per-IP quota.
+
+    Quota bypass technique (same as MegaBasterd/MegaDownloader.exe):
+    1. Use Mega API to get individual file download URLs
+    2. Download each file through the current proxy/IP
+    3. When hitting 509 quota, rotate to next proxy/IP
+    4. Each new IP gets a fresh 5GB quota from Mega
+    5. If all proxies exhausted, trigger Render restart for fresh IP
     """
 
     def __init__(self, download_base: str = "/data/mega_downloads"):
         self.download_base = download_base
-        self._megatools_available = _ensure_megatools()
         self.proxies = _get_proxy_list()
         if self.proxies:
-            print(f"[MegaDownloader] Loaded {len(self.proxies)} proxies for rotation")
+            print(f"[MegaDownloader] {len(self.proxies)} proxies for rotation")
 
     def download_folder(
         self,
         mega_link: str,
         job_id: int,
-        excluded_files: list[str] = None,
+        excluded_files: list = None,
         progress_callback=None,
     ) -> str:
-        """Download a Mega folder with speed optimizations.
-
-        Strategy:
-        1. Try direct download first (fastest if not throttled)
-        2. If throttled, rotate through proxy list
-        3. If all proxies exhausted, trigger Render restart for fresh IP
-        4. megadl resumes automatically, so restarts don't lose progress
-        """
-        if not self._megatools_available:
-            raise Exception(
-                "megatools (megadl) is not available and could not be installed. "
-                "Please ensure megatools is installed on the server."
-            )
-
         if excluded_files is None:
             excluded_files = []
 
         download_path = os.path.join(self.download_base, str(job_id))
         os.makedirs(download_path, exist_ok=True)
 
-        # Update job status to downloading
         conn = get_connection()
         conn.execute(
             "UPDATE transfer_jobs SET status = 'downloading' WHERE id = ?",
@@ -312,23 +388,112 @@ class MegaDownloader:
         conn.close()
 
         try:
-            success = self._download_with_rotation(mega_link, download_path)
+            folder_id, folder_key = _parse_folder_link(mega_link)
+            print(f"[MegaDownloader] Folder ID: {folder_id}")
+            sys.stdout.flush()
 
-            if not success:
-                raise Exception(
-                    "Download failed after all retry attempts. "
-                    "Mega may be throttling. The job will resume on next service restart."
+            print("[MegaDownloader] Listing folder contents via Mega API...")
+            sys.stdout.flush()
+            all_files = _list_folder_files(folder_id, folder_key)
+            print(f"[MegaDownloader] Found {len(all_files)} files in folder")
+            sys.stdout.flush()
+
+            # Filter excluded files before download
+            files_to_download = []
+            for f in all_files:
+                skip = False
+                for excluded in excluded_files:
+                    if excluded.strip() and excluded.strip().lower() in f['name'].lower():
+                        print(f"[Exclude] Skipping: {f['name']}")
+                        skip = True
+                        break
+                if not skip:
+                    files_to_download.append(f)
+
+            total_files = len(files_to_download)
+            total_size_mb = sum(f['size'] for f in files_to_download) / (1024 * 1024)
+            print(f"[MegaDownloader] {total_files} files to download ({total_size_mb:.1f} MB)")
+            sys.stdout.flush()
+
+            conn = get_connection()
+            conn.execute(
+                "UPDATE transfer_jobs SET total_files = ? WHERE id = ?",
+                (total_files, job_id),
+            )
+            conn.commit()
+            conn.close()
+
+            # Download each file with proxy rotation for quota bypass
+            rotator = ProxyRotator(self.proxies)
+            downloaded = 0
+            failed_files = []
+            render_restart_attempted = False
+
+            for i, file_info in enumerate(files_to_download):
+                fpath = file_info['path']
+                fsize_mb = file_info['size'] / (1024 * 1024)
+                dest_path = os.path.join(download_path, fpath)
+
+                print(f"[Download {i+1}/{total_files}] {fpath} ({fsize_mb:.1f} MB)")
+                sys.stdout.flush()
+
+                # Resume support: skip already downloaded files
+                if os.path.exists(dest_path) and os.path.getsize(dest_path) == file_info['size']:
+                    print(f"  Already downloaded, skipping")
+                    downloaded += 1
+                    continue
+
+                success = self._download_single_file(
+                    file_info, folder_id, dest_path, rotator
                 )
 
-        except subprocess.TimeoutExpired:
-            raise Exception("Download timed out after 2 hours")
+                if success:
+                    downloaded += 1
+                    progress = 10 + int(80 * downloaded / total_files)
+                    conn = get_connection()
+                    conn.execute(
+                        "UPDATE transfer_jobs SET progress = ? WHERE id = ?",
+                        (progress, job_id),
+                    )
+                    conn.commit()
+                    conn.close()
+                else:
+                    if not render_restart_attempted and rotator.all_exhausted():
+                        print("[MegaDownloader] All proxies exhausted. Triggering Render restart...")
+                        sys.stdout.flush()
+                        render_restart_attempted = True
+                        if _trigger_render_restart():
+                            self._save_resume_state(job_id, download_path, downloaded)
+                            raise Exception(
+                                "RENDER_RESTART: Job will resume with fresh IP."
+                            )
+                    failed_files.append(file_info)
 
-        # Remove excluded files
-        self._remove_excluded_files(download_path, excluded_files)
+            # Retry failed files with reset proxies
+            if failed_files:
+                print(f"[MegaDownloader] Retrying {len(failed_files)} failed files...")
+                sys.stdout.flush()
+                rotator.reset()
+                for file_info in failed_files:
+                    dest_path = os.path.join(download_path, file_info['path'])
+                    if self._download_single_file(file_info, folder_id, dest_path, rotator):
+                        downloaded += 1
 
-        # Count files
+            if downloaded == 0:
+                raise Exception(
+                    "Download failed: No files could be downloaded. "
+                    "Mega quota may be exceeded on all available IPs."
+                )
+
+            print(f"[MegaDownloader] Downloaded {downloaded}/{total_files} files")
+            sys.stdout.flush()
+
+        except Exception as e:
+            if "RENDER_RESTART" in str(e):
+                raise
+            raise
+
         file_count = self._count_files(download_path)
-
         conn = get_connection()
         conn.execute(
             "UPDATE transfer_jobs SET total_files = ? WHERE id = ?",
@@ -336,71 +501,59 @@ class MegaDownloader:
         )
         conn.commit()
         conn.close()
-
         return download_path
 
-    def _download_with_rotation(self, mega_link: str, download_path: str) -> bool:
-        """Try downloading with proxy rotation for speed.
+    def _download_single_file(
+        self, file_info: dict, folder_id: str, dest_path: str,
+        rotator: ProxyRotator, max_proxy_attempts: int = 10,
+    ) -> bool:
+        attempts = 0
+        while attempts < max_proxy_attempts:
+            proxy = rotator.get_current_proxy()
+            proxy_label = proxy or 'direct'
 
-        Order:
-        1. Direct connection (no proxy)
-        2. Each proxy in the proxy list
-        3. Trigger Render restart for fresh IP, then retry direct
-        """
-        # Clean up any leftover files from previous attempts
-        if os.path.exists(download_path) and os.listdir(download_path):
-            print(f"[Download] Cleaning up {download_path} from previous attempt")
-            shutil.rmtree(download_path)
-            os.makedirs(download_path, exist_ok=True)
+            dl_url = _get_download_url(file_info['handle'], folder_id, proxy=proxy)
+            if dl_url is None:
+                print(f"  Quota hit on {proxy_label}, rotating...")
+                sys.stdout.flush()
+                rotator.mark_exhausted()
+                if not rotator.rotate():
+                    return False
+                attempts += 1
+                continue
 
-        # Attempt 1: Direct connection
-        print("[Download] Trying direct connection...")
-        if _download_with_retry(mega_link, download_path, proxy=None, max_retries=2):
-            return True
-
-        # Attempt 2: Try each proxy
-        for i, proxy in enumerate(self.proxies):
-            print(f"[Download] Trying proxy {i + 1}/{len(self.proxies)}: {proxy}")
-            if _download_with_retry(mega_link, download_path, proxy=proxy, max_retries=2):
+            success = _download_and_decrypt_file(
+                dl_url=dl_url, dest_path=dest_path,
+                file_key=file_info['file_key'], node_key=file_info['node_key'],
+                file_size=file_info['size'], proxy=proxy,
+            )
+            if success:
                 return True
 
-        # Attempt 3: Trigger Render restart for fresh IP
-        print("[Download] All proxies exhausted, attempting Render IP rotation...")
-        if _trigger_render_restart():
-            print("[Download] Render restart triggered. Job will resume with fresh IP.")
-            return False
+            print(f"  Download failed on {proxy_label}, rotating...")
+            sys.stdout.flush()
+            rotator.mark_exhausted()
+            if not rotator.rotate():
+                return False
+            attempts += 1
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        return False
 
-        # Final attempt: Try direct one more time (maybe throttle expired)
-        print("[Download] Final direct attempt...")
-        return _download_with_retry(mega_link, download_path, proxy=None, max_retries=1, timeout=7200)
-
-    def _remove_excluded_files(self, base_path: str, excluded_files: list[str]):
-        """Remove excluded files from the downloaded folder."""
-        if not excluded_files:
-            return
-
-        removed = 0
-        for root, dirs, files in os.walk(base_path):
-            for fname in files:
-                for excluded in excluded_files:
-                    if excluded.strip() and excluded.strip().lower() in fname.lower():
-                        filepath = os.path.join(root, fname)
-                        os.remove(filepath)
-                        removed += 1
-                        print(f"[Exclude] Removed: {fname}")
-                        break
-
-        if removed:
-            print(f"[Exclude] Total files removed: {removed}")
+    def _save_resume_state(self, job_id: int, download_path: str, downloaded: int):
+        state = {'downloaded': downloaded}
+        state_path = os.path.join(download_path, '.resume_state.json')
+        with open(state_path, 'w') as f:
+            json.dump(state, f)
+        print(f"[Resume] Saved state: {downloaded} files downloaded")
 
     def _count_files(self, path: str) -> int:
         count = 0
         for root, dirs, files in os.walk(path):
-            count += len(files)
+            count += sum(1 for f in files if not f.startswith('.'))
         return count
 
     def cleanup(self, job_id: int):
-        """Remove downloaded files for a job."""
         download_path = os.path.join(self.download_base, str(job_id))
         if os.path.exists(download_path):
             shutil.rmtree(download_path)
