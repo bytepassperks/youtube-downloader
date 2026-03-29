@@ -289,6 +289,25 @@ class TorManager:
         with open(self.torrc_path, 'w') as f:
             f.write(config)
 
+    def _kill_existing_tor(self):
+        """Kill any existing Tor processes to free ports."""
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", "tor -f /tmp/torrc"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                print("[Tor] Killed existing Tor process")
+                time.sleep(1)  # Wait for port release
+        except Exception:
+            pass
+        # Also try killall as fallback
+        try:
+            subprocess.run(["killall", "tor"], capture_output=True, timeout=5)
+            time.sleep(1)
+        except Exception:
+            pass
+
     def start(self) -> bool:
         """Start Tor daemon. Returns True when ready."""
         tor_bin = shutil.which("tor")
@@ -296,6 +315,7 @@ class TorManager:
             print("[Tor] Binary not found")
             return False
         self.stop()
+        self._kill_existing_tor()  # Kill any leftover Tor from previous runs
         self._write_torrc()
         print(f"[Tor] Starting (SOCKS5 port {self.socks_port})...")
         sys.stdout.flush()
