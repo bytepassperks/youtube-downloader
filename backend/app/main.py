@@ -47,7 +47,7 @@ async def startup():
     # Resume incomplete transfer jobs (e.g., after Render restart for IP rotation)
     from app.services.transfer_worker import process_transfer_job
     incomplete = conn.execute(
-        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading', 'queued')"
+        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading', 'queued', 'failed')"
     ).fetchall()
     conn.close()
 

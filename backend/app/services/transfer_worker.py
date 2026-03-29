@@ -78,8 +78,8 @@ def _run_transfer(job_id: int):
     downloader = MegaDownloader()
 
     try:
-        # Step 1: Download from Mega
-        _update_job(job_id, status="downloading", progress=10)
+        # Step 1: Download from Mega (reset error state if retrying)
+        _update_job(job_id, status="downloading", progress=10, error_message="")
         download_path = downloader.download_folder(
             mega_link=job["mega_link"],
             job_id=job_id,
