@@ -124,7 +124,8 @@ async def retry_job(job_id: int, admin: dict = Depends(get_admin_user)):
     conn.execute(
         """UPDATE transfer_jobs
            SET status = 'queued', progress = 0, error_message = '',
-               uploaded_files = 0, total_files = 0
+               uploaded_files = 0, total_files = 0,
+               completed_at = NULL, telegram_sent = 0
            WHERE id = ?""",
         (job_id,),
     )
