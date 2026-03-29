@@ -1405,16 +1405,17 @@ class IPRotator:
         return "unknown"
 
     def get_all_proxies(self) -> list:
-        """Get a list of *unique* fast proxy URLs for parallel downloads.
+        """Get a list of *unique* WARP proxy URLs for parallel downloads.
 
-        ONLY returns fast proxies (WARP, Psiphon).  Slow proxies (Tor,
-        free pool) are deliberately excluded so they never bottleneck a
-        parallel chunk download.
+        ONLY returns WARP proxies.  Psiphon, Tor, and free pool are
+        excluded because parallel downloads are only as fast as the
+        slowest chunk — mixing fast WARP (~50 Mbps) with slower Psiphon
+        (~5 Mbps) bottlenecks the whole download.
 
         IMPORTANT: We do NOT duplicate proxies.  Each proxy maps to a
         separate Cloudflare/Mega quota slot.  Reusing the same proxy for
         multiple chunks makes them compete for the same quota and causes
-        509 errors.  If we have 3 unique fast proxies, we use 3 chunks.
+        509 errors.  If we have 3 unique WARP proxies, we use 3 chunks.
         """
         fast = []
         # WARP — fastest (Cloudflare CDN, 50-200 Mbps)
@@ -1422,11 +1423,8 @@ class IPRotator:
             url = w.get_proxy_url()
             if url and url not in fast:
                 fast.append(url)
-        # Psiphon — medium-fast (single hop, 5-15 Mbps)
-        for p in self.psiphon_instances:
-            url = p.get_proxy_url()
-            if url and url not in fast:
-                fast.append(url)
+        # Do NOT include Psiphon/Tor — they are much slower and would
+        # bottleneck the entire parallel download.
         return fast if fast else [None]
 
     def rotate(self) -> bool:
