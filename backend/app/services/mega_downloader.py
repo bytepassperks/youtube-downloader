@@ -32,13 +32,13 @@ from app.database import get_connection
 
 # Configuration
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
-PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "16"))  # chunks per large file (MegaDownloader uses 10, we go higher)
+PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "16"))  # chunks per large file (MegaDownloader uses 10, we go 16)
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB - files above this use parallel chunks
 # Max total memory for parallel chunks.  On a 2 GB plan, proxies + FastAPI
 # use ~500 MB, so we can safely use ~1.2 GB for parallel chunk buffers.
 # Parallel streaming now uses true streaming: each thread buffers only 8 MB
 # at a time (same as single-stream), so memory = 8 MB * num_threads = 64 MB
-# for 8 threads.  Safe on any plan.  This guard is kept as a safety net but
+# for 8 threads (128 MB for 16).  Safe on any plan.  This guard is kept as a safety net but
 # the default is high enough to never trigger on the Standard 2 GB plan.
 _PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "1500")) * 1024 * 1024
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
@@ -1089,6 +1089,7 @@ def _stream_chunk_and_upload_parts(
     storage, remote_key: str, upload_id: str,
     first_part_number: int,
     proxy: str = None, chunk_id: int = 0,
+    shared_bytes_counter=None,
 ) -> list:
     """Download a byte-range from Mega, decrypt in 8 MB pieces, upload each
     piece as a separate S3 multipart part.
@@ -1099,6 +1100,8 @@ def _stream_chunk_and_upload_parts(
     Memory: holds only ~8 MB buffer at a time (same as single-stream).
     Disk: 0.
     Aborts if download speed drops below _MIN_CHUNK_SPEED for _CHUNK_SPEED_CHECK_INTERVAL.
+    shared_bytes_counter: if provided, a list [total_bytes] shared across threads
+    for aggregate speed reporting.
     """
     parts = []
     try:
@@ -1106,7 +1109,7 @@ def _stream_chunk_and_upload_parts(
         headers = {'Range': f'bytes={start_byte}-{end_byte}'}
         resp = requests.get(
             dl_url, stream=True, proxies=proxies,
-            headers=headers, timeout=(30, 600),
+            headers=headers, timeout=(15, 300),
         )
         if resp.status_code == 509:
             print(f"[StreamChunk-{chunk_id}] 509 over quota")
@@ -1139,6 +1142,8 @@ def _stream_chunk_and_upload_parts(
                 continue
             decrypted = cipher.decrypt(raw)
             dl_bytes += len(raw)
+            if shared_bytes_counter is not None:
+                shared_bytes_counter[0] += len(raw)
 
             # Trim if we've passed file_size (Mega pads to AES block boundary)
             total_so_far = dl_bytes
@@ -1238,6 +1243,27 @@ def _stream_parallel_download_upload(
         sys.stdout.flush()
         start_time = time.time()
 
+        # Shared counter for aggregate progress across all threads
+        # Using a list so threads can mutate it (thread-safe for += on CPython due to GIL)
+        shared_bytes = [0]
+        progress_done = [False]
+
+        # Background thread to report aggregate speed via speed_callback
+        def _report_progress():
+            while not progress_done[0]:
+                time.sleep(5)
+                if progress_done[0]:
+                    break
+                elapsed = time.time() - start_time
+                if elapsed > 0 and shared_bytes[0] > 0:
+                    speed = (shared_bytes[0] / (1024 * 1024)) / elapsed
+                    if speed_callback:
+                        speed_callback(shared_bytes[0], file_size, speed)
+
+        import threading
+        progress_thread = threading.Thread(target=_report_progress, daemon=True)
+        progress_thread.start()
+
         # Build chunk specs: (index, start_byte, end_byte, proxy, first_part)
         chunk_specs = []
         for i in range(num_chunks):
@@ -1260,6 +1286,7 @@ def _stream_parallel_download_upload(
                     storage, remote_key, upload_id,
                     first_part,
                     proxy, i,
+                    shared_bytes,
                 )
                 futures[future] = i
 
@@ -1270,6 +1297,8 @@ def _stream_parallel_download_upload(
                 except Exception as e:
                     print(f"[StreamParallel] Chunk {idx} exception: {e}")
                     results[idx] = []
+
+        progress_done[0] = True
 
         # --- Phase 2: retry failed chunks sequentially ---
         # After parallel phase completes, all other connections are closed,
