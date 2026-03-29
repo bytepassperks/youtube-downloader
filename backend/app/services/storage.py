@@ -18,9 +18,12 @@ class IDriveStorage:
     """iDrive E2 S3-compatible storage."""
 
     def __init__(self):
+        endpoint = settings.IDRIVE_ENDPOINT
+        if not endpoint.startswith("http"):
+            endpoint = f"https://{endpoint}"
         self.client = boto3.client(
             "s3",
-            endpoint_url=f"https://{settings.IDRIVE_ENDPOINT}",
+            endpoint_url=endpoint,
             aws_access_key_id=settings.IDRIVE_ACCESS_KEY,
             aws_secret_access_key=settings.IDRIVE_SECRET_KEY,
             region_name=settings.IDRIVE_REGION,
