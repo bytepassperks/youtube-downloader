@@ -62,6 +62,9 @@ async def create_job(job: JobCreate, admin: dict = Depends(get_admin_user)):
     new_job = conn.execute("SELECT * FROM transfer_jobs WHERE id = ?", (job_id,)).fetchone()
     conn.close()
 
+    # Auto-start the job in background
+    process_transfer_job(job_id)
+
     return _job_to_response(dict(new_job))
 
 
