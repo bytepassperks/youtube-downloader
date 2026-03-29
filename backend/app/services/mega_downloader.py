@@ -32,13 +32,13 @@ from app.database import get_connection
 
 # Configuration
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
-PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "4"))  # chunks per large file
+PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "16"))  # chunks per large file (MegaDownloader uses 10, we go higher)
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB - files above this use parallel chunks
 # Max total memory for parallel chunks.  On a 2 GB plan, proxies + FastAPI
 # use ~500 MB, so we can safely use ~1.2 GB for parallel chunk buffers.
 # Parallel streaming now uses true streaming: each thread buffers only 8 MB
-# at a time (same as single-stream), so memory = 8 MB * num_threads = 32 MB
-# for 4 threads.  Safe on any plan.  This guard is kept as a safety net but
+# at a time (same as single-stream), so memory = 8 MB * num_threads = 64 MB
+# for 8 threads.  Safe on any plan.  This guard is kept as a safety net but
 # the default is high enough to never trigger on the Standard 2 GB plan.
 _PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "1500")) * 1024 * 1024
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
@@ -1205,24 +1205,21 @@ def _stream_parallel_download_upload(
 
     Each thread downloads its byte-range, decrypts in 8 MB streaming pieces,
     and uploads each piece as a separate S3 multipart part.  Zero disk usage.
-    Memory: ~8 MB per thread = ~32 MB for 4 threads.  Works for ANY file size.
+    Memory: ~8 MB per thread = ~64 MB for 8 threads.  Works for ANY file size.
 
-    Uses only unique proxies to avoid Mega's per-IP concurrent connection
-    limit (duplicate proxy = 509 over quota).  Failed chunks are retried
-    sequentially after the parallel batch completes.
+    MegaDownloader-style: uses multiple parallel byte-range connections through
+    the SAME proxy/IP.  Mega allows concurrent chunk downloads from a single IP
+    (up to ~10 connections) — it only blocks different IPs hitting the same file.
+    Failed chunks are retried sequentially after the parallel batch completes.
     """
-    # De-duplicate proxies — Mega blocks multiple connections from same IP
-    unique_proxies = list(dict.fromkeys(p for p in proxies if p))
-    if not unique_proxies:
-        unique_proxies = [None]  # direct connection
-    num_chunks = min(len(unique_proxies), PARALLEL_CHUNKS)
-    if num_chunks < 2:
-        # Only 1 unique proxy — fall back to single-stream
-        return _stream_download_and_upload(
-            dl_url, file_key, node_key, file_size, storage, remote_key,
-            proxy=unique_proxies[0],
-            speed_callback=speed_callback,
-        )
+    # Pick the best single proxy to use for ALL threads (MegaDownloader approach).
+    # Mega allows multiple byte-range connections from the same IP.
+    best_proxy = None
+    for p in proxies:
+        if p:  # prefer a non-None proxy (WARP/Psiphon)
+            best_proxy = p
+            break
+    num_chunks = PARALLEL_CHUNKS  # always use full parallelism
 
     upload_id = None
     try:
@@ -1236,7 +1233,8 @@ def _stream_parallel_download_upload(
         last_chunk_size = file_size - (num_chunks - 1) * chunk_size
         parts_last_chunk = (last_chunk_size + _MIN_PART_SIZE - 1) // _MIN_PART_SIZE + 1
 
-        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} threads, {len(unique_proxies)} unique proxies (~8 MB/part) -> S3")
+        proxy_label = best_proxy or 'direct'
+        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} threads via {proxy_label} (~8 MB/part) -> S3")
         sys.stdout.flush()
         start_time = time.time()
 
@@ -1245,7 +1243,7 @@ def _stream_parallel_download_upload(
         for i in range(num_chunks):
             start_byte = i * chunk_size
             end_byte = file_size - 1 if i == num_chunks - 1 else (i + 1) * chunk_size - 1
-            proxy = unique_proxies[i % len(unique_proxies)]
+            proxy = best_proxy  # same proxy for all threads (MegaDownloader-style)
             first_part = i * parts_per_chunk + 1
             chunk_specs.append((i, start_byte, end_byte, proxy, first_part))
 
