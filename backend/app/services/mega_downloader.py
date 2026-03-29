@@ -259,6 +259,12 @@ def _download_and_decrypt_file(
     except requests.exceptions.Timeout:
         print(f"[Download] Timeout")
         return False
+    except OSError as e:
+        if e.errno == 28:  # ENOSPC - No space left on device
+            print(f"[Download] DISK FULL: {e}")
+            raise  # Propagate disk full errors up instead of retrying
+        print(f"[Download] OS Error: {e}")
+        return False
     except Exception as e:
         print(f"[Download] Error: {e}")
         return False
@@ -771,6 +777,9 @@ class MegaDownloader:
         if excluded_files is None:
             excluded_files = []
 
+        # Clean up old job downloads to free disk space before starting
+        self._cleanup_old_downloads(job_id)
+
         download_path = os.path.join(self.download_base, str(job_id))
         os.makedirs(download_path, exist_ok=True)
 
@@ -991,6 +1000,49 @@ class MegaDownloader:
         for root, dirs, files in os.walk(path):
             count += sum(1 for f in files if not f.startswith('.'))
         return count
+
+    def _cleanup_old_downloads(self, current_job_id: int):
+        """Remove download files from ALL previous jobs to free disk space.
+
+        The persistent disk on Render is limited (1-5 GB). Old job files
+        should already be uploaded to cloud storage, so they can be safely
+        deleted.
+        """
+        if not os.path.exists(self.download_base):
+            return
+        freed = 0
+        for entry in os.listdir(self.download_base):
+            if entry == str(current_job_id):
+                continue  # Keep current job's partial downloads for resume
+            entry_path = os.path.join(self.download_base, entry)
+            if os.path.isdir(entry_path):
+                try:
+                    dir_size = sum(
+                        os.path.getsize(os.path.join(r, f))
+                        for r, _, files in os.walk(entry_path)
+                        for f in files
+                    )
+                    shutil.rmtree(entry_path)
+                    freed += dir_size
+                    print(f"[Cleanup] Removed old job {entry} files ({dir_size / (1024*1024):.1f} MB)")
+                except Exception as e:
+                    print(f"[Cleanup] Failed to remove {entry}: {e}")
+        # Also clean Psiphon/Tor temp data
+        for tmp_dir in ["/tmp/psiphon_data", "/tmp/tor_data"]:
+            if os.path.exists(tmp_dir):
+                try:
+                    dir_size = sum(
+                        os.path.getsize(os.path.join(r, f))
+                        for r, _, files in os.walk(tmp_dir)
+                        for f in files
+                    )
+                    shutil.rmtree(tmp_dir)
+                    freed += dir_size
+                except Exception:
+                    pass
+        if freed > 0:
+            print(f"[Cleanup] Total freed: {freed / (1024*1024):.1f} MB")
+        sys.stdout.flush()
 
     def cleanup(self, job_id: int):
         download_path = os.path.join(self.download_base, str(job_id))
