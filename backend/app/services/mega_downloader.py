@@ -427,7 +427,7 @@ class MegaDownloader:
             rotator = ProxyRotator(self.proxies)
             downloaded = 0
             failed_files = []
-            render_restart_attempted = False
+            consecutive_failures = 0
 
             for i, file_info in enumerate(files_to_download):
                 fpath = file_info['path']
@@ -441,6 +441,7 @@ class MegaDownloader:
                 if os.path.exists(dest_path) and os.path.getsize(dest_path) == file_info['size']:
                     print(f"  Already downloaded, skipping")
                     downloaded += 1
+                    consecutive_failures = 0
                     continue
 
                 success = self._download_single_file(
@@ -449,6 +450,7 @@ class MegaDownloader:
 
                 if success:
                     downloaded += 1
+                    consecutive_failures = 0
                     progress = 10 + int(80 * downloaded / total_files)
                     conn = get_connection()
                     conn.execute(
@@ -458,26 +460,34 @@ class MegaDownloader:
                     conn.commit()
                     conn.close()
                 else:
-                    if not render_restart_attempted and rotator.all_exhausted():
-                        print("[MegaDownloader] All proxies exhausted. Triggering Render restart...")
-                        sys.stdout.flush()
-                        render_restart_attempted = True
-                        if _trigger_render_restart():
-                            self._save_resume_state(job_id, download_path, downloaded)
-                            raise Exception(
-                                "RENDER_RESTART: Job will resume with fresh IP."
-                            )
+                    consecutive_failures += 1
                     failed_files.append(file_info)
+                    # If all proxies exhausted and many consecutive failures,
+                    # wait 60s then reset proxies for a fresh round
+                    if rotator.all_exhausted() and consecutive_failures >= 3:
+                        print(f"[MegaDownloader] All proxies exhausted after {consecutive_failures} failures. Waiting 60s before retrying...")
+                        sys.stdout.flush()
+                        time.sleep(60)
+                        rotator.reset()
+                        consecutive_failures = 0
 
             # Retry failed files with reset proxies
             if failed_files:
                 print(f"[MegaDownloader] Retrying {len(failed_files)} failed files...")
                 sys.stdout.flush()
                 rotator.reset()
+                still_failed = []
                 for file_info in failed_files:
                     dest_path = os.path.join(download_path, file_info['path'])
+                    if os.path.exists(dest_path) and os.path.getsize(dest_path) == file_info['size']:
+                        downloaded += 1
+                        continue
                     if self._download_single_file(file_info, folder_id, dest_path, rotator):
                         downloaded += 1
+                    else:
+                        still_failed.append(file_info['name'])
+                if still_failed:
+                    print(f"[MegaDownloader] {len(still_failed)} files could not be downloaded: {still_failed[:5]}")
 
             if downloaded == 0:
                 raise Exception(

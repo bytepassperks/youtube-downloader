@@ -44,16 +44,17 @@ async def startup():
         )
     conn.commit()
 
-    # Resume incomplete transfer jobs (e.g., after Render restart for IP rotation)
+    # Resume jobs that were interrupted mid-process (not failed/queued ones
+    # to avoid restart loops when quota is exhausted)
     from app.services.transfer_worker import process_transfer_job
     incomplete = conn.execute(
-        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading', 'queued', 'failed')"
+        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading')"
     ).fetchall()
     conn.close()
 
     for row in incomplete:
         job_id = row["id"]
-        print(f"[Startup] Resuming incomplete job {job_id}")
+        print(f"[Startup] Resuming interrupted job {job_id}")
         process_transfer_job(job_id)
 
 
