@@ -1000,37 +1000,62 @@ class IPRotator:
     def _warmup_proxies(self):
         """Proactively start proxy tools at init for parallel downloads.
 
-        Memory-aware: Render Starter plan has only 512MB RAM.
+        Standard plan (2GB RAM) budget:
         - FastAPI + worker: ~150MB
-        - Each proxy process: ~50-100MB
-        - Budget for proxies: ~250MB (2-3 processes max)
+        - WARP (wireproxy): ~80MB per instance
+        - Psiphon: ~80MB per instance
+        - Tor: ~60MB
+        - Budget: ~1.5GB for proxies
 
-        Strategy: Start direct + 1 Psiphon + Tor = 3 channels.
-        Skip WARP on low-memory hosts (wireproxy is too heavy).
-        Use free proxy pool as zero-memory parallel channel.
+        Start everything for maximum parallel channels.
+        Each tool wrapped in try/except so failures don't crash the job.
         """
-        print("[IPRotator] Warming up proxies (memory-safe mode)...")
+        print("[IPRotator] Warming up ALL proxy tools for parallel downloads...")
         sys.stdout.flush()
         started = 0
 
-        # 1. Start 1 Psiphon instance (~80MB, fastest available proxy)
-        if self.psiphon_available:
+        # 1. Try WARP first (fastest — Cloudflare CDN, 50-200 Mbps)
+        if self.warp_available:
             try:
-                psiphon = PsiphonManager(instance_id=0)
-                if psiphon.start():
-                    self.psiphon_instances.append(psiphon)
+                warp = WARPManager(instance_id=0)
+                if warp.start():
+                    self.warp_instances.append(warp)
                     started += 1
-                    self.current_mode = "psiphon"
-                    print(f"[IPRotator] Psiphon-0 ready (port {psiphon.socks_port})")
+                    self.current_mode = "warp"
+                    self.current_warp_idx = 0
+                    print(f"[IPRotator] WARP-0 ready (port {warp.socks_port})")
                 else:
-                    self.psiphon_failed = True
-                    print(f"[IPRotator] Psiphon-0 failed")
+                    self.warp_failed = True
+                    print(f"[IPRotator] WARP not available on this host")
             except Exception as e:
-                self.psiphon_failed = True
-                print(f"[IPRotator] Psiphon error: {e}")
+                self.warp_failed = True
+                print(f"[IPRotator] WARP error: {e}")
             sys.stdout.flush()
 
-        # 2. Start Tor as secondary channel (~60MB)
+        # 2. Start 2 Psiphon instances for parallel channels (~80MB each)
+        if self.psiphon_available:
+            for i in range(2):
+                try:
+                    psiphon = PsiphonManager(instance_id=i)
+                    if psiphon.start():
+                        self.psiphon_instances.append(psiphon)
+                        started += 1
+                        print(f"[IPRotator] Psiphon-{i} ready (port {psiphon.socks_port})")
+                        if self.current_mode == "direct":
+                            self.current_mode = "psiphon"
+                    else:
+                        print(f"[IPRotator] Psiphon-{i} failed")
+                        if i == 0:
+                            self.psiphon_failed = True
+                        break
+                except Exception as e:
+                    print(f"[IPRotator] Psiphon-{i} error: {e}")
+                    if i == 0:
+                        self.psiphon_failed = True
+                    break
+                sys.stdout.flush()
+
+        # 3. Start Tor (~60MB)
         if self.tor_available:
             try:
                 self.tor_manager = TorManager()
@@ -1047,7 +1072,7 @@ class IPRotator:
                 print(f"[IPRotator] Tor error: {e}")
             sys.stdout.flush()
 
-        # 3. Pre-fetch free proxy pool (0 memory — just a list of IPs)
+        # 4. Pre-fetch free proxy pool (0 memory — just a list of IPs)
         try:
             pool_count = self.free_proxy_pool.refresh()
             if pool_count > 0:
@@ -1056,12 +1081,6 @@ class IPRotator:
         except Exception as e:
             print(f"[IPRotator] Free pool error: {e}")
         sys.stdout.flush()
-
-        # Skip WARP on Render Starter (wireproxy + wgcf too memory-heavy)
-        # WARP will be tried lazily via rotate() if other proxies fail
-        if self.warp_available:
-            print(f"[IPRotator] WARP available but deferred (memory-safe mode)")
-            sys.stdout.flush()
 
         all_proxies = self.get_all_proxies()
         print(f"[IPRotator] Warmup done: {started} tools, {len(all_proxies)} channels, mode={self.current_mode}")
