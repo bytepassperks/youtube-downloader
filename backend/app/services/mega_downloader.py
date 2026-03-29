@@ -80,6 +80,8 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
 
     Returns True on success, False if throttled/failed after retries.
     Uses Popen to stream megadl output live to logs for visibility.
+    Handles 'file already exists' by cleaning up partial downloads before retry.
+    Detects 0 bytes/s stall and aborts early to try next proxy.
     """
     import sys
 
@@ -104,15 +106,31 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
             output_lines = []
             start_time = time.time()
             last_log_time = start_time
+            zero_speed_count = 0
+            has_file_exists_error = False
 
             # Read output line by line, streaming to stdout
             for line in proc.stdout:
                 line = line.strip()
                 if line:
                     output_lines.append(line)
+
+                    # Detect "file already exists" error
+                    if "file already exists" in line.lower():
+                        has_file_exists_error = True
+
+                    # Detect stalled download (0 bytes/s repeatedly)
+                    if "0 bytes/s" in line and "0.00%" in line:
+                        zero_speed_count += 1
+                        if zero_speed_count >= 5:
+                            print(f"[Download] Stalled at 0 bytes/s for {zero_speed_count} checks, aborting")
+                            sys.stdout.flush()
+                            proc.kill()
+                            break
+
                     # Log every line but also periodic progress
                     now = time.time()
-                    if now - last_log_time >= 30 or len(output_lines) <= 5:
+                    if now - last_log_time >= 30 or len(output_lines) <= 10:
                         print(f"[megadl] {line}")
                         sys.stdout.flush()
                         last_log_time = now
@@ -130,11 +148,31 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
             print(f"[Download] Process exited with code {proc.returncode} after {elapsed}s, {len(output_lines)} lines output")
             sys.stdout.flush()
 
+            # If we got "file already exists" errors, clean up and retry
+            if has_file_exists_error and proc.returncode != 0:
+                print(f"[Download] Cleaning up existing files in {download_path} for fresh download")
+                sys.stdout.flush()
+                if os.path.exists(download_path):
+                    shutil.rmtree(download_path)
+                    os.makedirs(download_path, exist_ok=True)
+                if attempt < max_retries - 1:
+                    continue
+
             # Check for success
             if proc.returncode == 0:
                 print(f"[Download] Success with proxy={proxy or 'direct'}")
                 sys.stdout.flush()
                 return True
+
+            # If stalled at 0 bytes/s, treat as throttled
+            if zero_speed_count >= 5:
+                print(f"[Download] Treated as throttled (stalled at 0 bytes/s)")
+                sys.stdout.flush()
+                # Clean up partial files before trying next proxy
+                if os.path.exists(download_path):
+                    shutil.rmtree(download_path)
+                    os.makedirs(download_path, exist_ok=True)
+                return False  # Return False immediately to try next proxy
 
             # Check for quota/bandwidth limit errors
             throttle_indicators = [
@@ -150,6 +188,10 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
             if is_throttled:
                 print(f"[Download] Throttled on attempt {attempt + 1}, proxy={proxy or 'direct'}")
                 sys.stdout.flush()
+                # Clean up partial files
+                if os.path.exists(download_path):
+                    shutil.rmtree(download_path)
+                    os.makedirs(download_path, exist_ok=True)
                 if attempt < max_retries - 1:
                     wait_time = 10 * (attempt + 1)
                     print(f"[Download] Waiting {wait_time}s before retry...")
@@ -305,6 +347,12 @@ class MegaDownloader:
         2. Each proxy in the proxy list
         3. Trigger Render restart for fresh IP, then retry direct
         """
+        # Clean up any leftover files from previous attempts
+        if os.path.exists(download_path) and os.listdir(download_path):
+            print(f"[Download] Cleaning up {download_path} from previous attempt")
+            shutil.rmtree(download_path)
+            os.makedirs(download_path, exist_ok=True)
+
         # Attempt 1: Direct connection
         print("[Download] Trying direct connection...")
         if _download_with_retry(mega_link, download_path, proxy=None, max_retries=2):
