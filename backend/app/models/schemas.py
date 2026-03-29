@@ -1,5 +1,5 @@
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from pydantic import BaseModel, EmailStr, field_validator
+from typing import Optional, Union
 from datetime import datetime
 
 
@@ -31,8 +31,19 @@ class TokenData(BaseModel):
 class JobCreate(BaseModel):
     title: str
     mega_link: str
-    excluded_files: list[str] = []
+    exclude_files: Union[str, list[str]] = []
     storage_target: str = "idrive"  # "idrive" or "b2"
+
+    @field_validator("exclude_files", mode="before")
+    @classmethod
+    def parse_exclude_files(cls, v):
+        if isinstance(v, str):
+            return [f.strip() for f in v.split(",") if f.strip()]
+        return v
+
+    @property
+    def excluded_files(self) -> list[str]:
+        return self.exclude_files
 
 
 class JobResponse(BaseModel):

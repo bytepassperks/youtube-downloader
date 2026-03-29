@@ -53,7 +53,7 @@ async def create_job(job: JobCreate, admin: dict = Depends(get_admin_user)):
         import time
         slug = f"{slug}-{int(time.time())}"
 
-    excluded_json = json.dumps(job.excluded_files)
+    excluded_json = json.dumps(job.exclude_files)
 
     cursor = conn.execute(
         """INSERT INTO transfer_jobs (title, mega_link, excluded_files, storage_target, download_slug)
