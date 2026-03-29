@@ -27,16 +27,22 @@ app.include_router(portal.router)
 @app.on_event("startup")
 async def startup():
     init_db()
-    # Create default admin if not exists
+    # Create or update default admin
     conn = get_connection()
     admin = conn.execute("SELECT id FROM users WHERE email = ?", (settings.ADMIN_EMAIL,)).fetchone()
+    hashed = get_password_hash(settings.ADMIN_PASSWORD)
     if not admin:
-        hashed = get_password_hash(settings.ADMIN_PASSWORD)
         conn.execute(
             "INSERT INTO users (email, hashed_password, is_admin) VALUES (?, ?, 1)",
             (settings.ADMIN_EMAIL, hashed),
         )
-        conn.commit()
+    else:
+        # Always update admin password to match env var
+        conn.execute(
+            "UPDATE users SET hashed_password = ? WHERE email = ?",
+            (hashed, settings.ADMIN_EMAIL),
+        )
+    conn.commit()
     conn.close()
 
 
