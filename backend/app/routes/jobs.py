@@ -32,6 +32,10 @@ def _job_to_response(job: dict) -> dict:
         "created_at": job["created_at"],
         "completed_at": job.get("completed_at"),
         "telegram_sent": bool(job["telegram_sent"]),
+        "current_file": job.get("current_file") or "",
+        "download_speed": job.get("download_speed") or "",
+        "upload_speed": job.get("upload_speed") or "",
+        "downloaded_files": job.get("downloaded_files") or 0,
     }
 
 

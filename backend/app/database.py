@@ -52,6 +52,10 @@ def init_db():
             folder_path TEXT DEFAULT '',
             download_slug TEXT UNIQUE,
             error_message TEXT DEFAULT '',
+            current_file TEXT DEFAULT '',
+            download_speed TEXT DEFAULT '',
+            upload_speed TEXT DEFAULT '',
+            downloaded_files INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
             completed_at TEXT,
             telegram_sent INTEGER DEFAULT 0
@@ -93,4 +97,18 @@ def init_db():
     """)
 
     conn.commit()
+
+    # Migrate existing databases: add new columns if missing
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(transfer_jobs)").fetchall()]
+        for col, default in [
+            ("current_file", "''"), ("download_speed", "''"),
+            ("upload_speed", "''"), ("downloaded_files", "0"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE transfer_jobs ADD COLUMN {col} TEXT DEFAULT {default}")
+        conn.commit()
+    except Exception:
+        pass
+
     conn.close()

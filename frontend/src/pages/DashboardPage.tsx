@@ -30,6 +30,10 @@ interface Job {
   created_at: string;
   completed_at: string | null;
   telegram_sent: boolean;
+  current_file: string;
+  download_speed: string;
+  upload_speed: string;
+  downloaded_files: number;
 }
 
 export default function DashboardPage() {
@@ -217,10 +221,23 @@ export default function DashboardPage() {
                 <div className="mt-4">
                   <div className="flex justify-between text-sm mb-1">
                     <span className={statusColor(job.status)}>
-                      {job.status === "downloading" ? "Downloading..." : "Uploading..."}
+                      {job.status === "downloading" ? "Downloading" : "Uploading"}
+                      {job.status === "downloading" && job.download_speed && (
+                        <span className="ml-2 text-cyan-400 font-mono text-xs">
+                          {job.download_speed}
+                        </span>
+                      )}
+                      {job.status === "uploading" && job.upload_speed && (
+                        <span className="ml-2 text-cyan-400 font-mono text-xs">
+                          {job.upload_speed}
+                        </span>
+                      )}
                     </span>
                     <span className="text-gray-400">
-                      {job.uploaded_files}/{job.total_files} files ({job.progress}%)
+                      {job.status === "downloading"
+                        ? `${job.downloaded_files}/${job.total_files} files`
+                        : `${job.uploaded_files}/${job.total_files} files`
+                      }{" "}({job.progress}%)
                     </span>
                   </div>
                   <div className="w-full bg-gray-800 rounded-full h-2">
@@ -231,6 +248,11 @@ export default function DashboardPage() {
                       style={{ width: `${job.progress}%` }}
                     />
                   </div>
+                  {job.current_file && (
+                    <p className="text-gray-500 text-xs mt-1.5 truncate font-mono">
+                      {job.current_file}
+                    </p>
+                  )}
                 </div>
               )}
 

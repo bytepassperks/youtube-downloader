@@ -51,6 +51,10 @@ class JobResponse(BaseModel):
     created_at: str
     completed_at: Optional[str]
     telegram_sent: bool
+    current_file: str = ""
+    download_speed: str = ""
+    upload_speed: str = ""
+    downloaded_files: int = 0
 
 
 class JobStatusUpdate(BaseModel):

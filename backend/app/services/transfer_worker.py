@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import re
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -38,8 +39,11 @@ def _upload_single_file(storage, local_file, remote_key, job_id, fname, relative
         file_size = os.path.getsize(local_file)
         print(f"[Upload] Uploading {fname} ({file_size} bytes) -> {remote_key}")
         sys.stdout.flush()
+        upload_start = time.time()
         storage.upload_file(local_file, remote_key)
-        print(f"[Upload] Uploaded {fname} successfully")
+        upload_elapsed = time.time() - upload_start
+        speed_mbps = (file_size / (1024 * 1024)) / max(upload_elapsed, 0.01)
+        print(f"[Upload] Uploaded {fname} ({speed_mbps:.1f} MB/s)")
         sys.stdout.flush()
 
         # Record in database
@@ -116,19 +120,10 @@ def _run_transfer(job_id: int):
 
         # Step 2: Upload to storage using parallel threads
         print(f"[Job {job_id}] Download complete. Starting upload phase...")
-        print(f"[Job {job_id}] Download path: {download_path}")
-        print(f"[Job {job_id}] Download path exists: {os.path.exists(download_path)}")
-        if os.path.exists(download_path):
-            all_on_disk = []
-            for r, d, fs in os.walk(download_path):
-                for f in fs:
-                    all_on_disk.append(os.path.join(r, f))
-            print(f"[Job {job_id}] Files on disk: {len(all_on_disk)}")
-            for fp in all_on_disk[:10]:
-                print(f"  {fp} ({os.path.getsize(fp)} bytes)")
         sys.stdout.flush()
 
-        _update_job(job_id, status="uploading", progress=40)
+        _update_job(job_id, status="uploading", progress=40,
+                    current_file="Starting uploads...")
         storage = get_storage(storage_target)
 
         # Check which files have already been uploaded (for resume support)
@@ -160,6 +155,8 @@ def _run_transfer(job_id: int):
 
         # Parallel upload using ThreadPoolExecutor
         uploaded = len(already_uploaded)
+        uploaded_bytes = 0
+        upload_start_time = time.time()
         print(f"[Upload] {len(files_to_upload)} files to upload, {len(already_uploaded)} already done")
         sys.stdout.flush()
         with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
@@ -169,21 +166,33 @@ def _run_transfer(job_id: int):
                     _upload_single_file,
                     storage, local_file, remote_key, job_id, fname, relative, storage_target,
                 )
-                futures[future] = fname
+                futures[future] = (fname, os.path.getsize(local_file) if os.path.exists(local_file) else 0)
 
             for future in as_completed(futures):
+                fname, fsize = futures[future]
                 if future.result():
                     uploaded += 1
+                    uploaded_bytes += fsize
                     progress = 40 + int((uploaded / max(total, 1)) * 50)
-                    _update_job(job_id, uploaded_files=uploaded, progress=progress)
+                    elapsed = time.time() - upload_start_time
+                    avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
+                    _update_job(
+                        job_id, uploaded_files=uploaded, progress=progress,
+                        current_file=f"Uploaded: {fname} ({uploaded}/{total})",
+                        upload_speed=f"{avg_speed:.1f} MB/s",
+                    )
 
         # Step 3: Mark complete
+        total_elapsed = time.time() - upload_start_time
+        final_speed = (uploaded_bytes / (1024 * 1024)) / max(total_elapsed, 0.1)
         _update_job(
             job_id,
             status="completed",
             progress=100,
             uploaded_files=uploaded,
             completed_at=datetime.utcnow().isoformat(),
+            current_file=f"Complete: {uploaded}/{total} files uploaded",
+            upload_speed=f"{final_speed:.1f} MB/s",
         )
 
         # Step 4: Send Telegram notification

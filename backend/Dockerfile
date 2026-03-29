@@ -1,12 +1,17 @@
 FROM python:3.12-slim
 
-# Install megatools and system dependencies
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends megatools curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Verify megadl is available
+# Download Psiphon binary for free IP rotation
+RUN curl -L -o /usr/local/bin/psiphon-tunnel-core \
+    https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/linux/psiphon-tunnel-core-x86_64 && \
+    chmod +x /usr/local/bin/psiphon-tunnel-core && \
+    mkdir -p /tmp/psiphon_datastore
+
 RUN megadl --version || true
 
 WORKDIR /app
