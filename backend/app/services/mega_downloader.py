@@ -264,6 +264,151 @@ def _download_and_decrypt_file(
         return False
 
 
+# --- Tor Manager --------------------------------------------------------
+
+class TorManager:
+    """Manages Tor for free IP rotation via SOCKS5 proxy."""
+
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self.socks_port = 9050
+        self.control_port = 9051
+        self.data_dir = "/tmp/tor_data"
+        self.torrc_path = "/tmp/torrc"
+        self.connected = False
+
+    def _write_torrc(self):
+        os.makedirs(self.data_dir, exist_ok=True)
+        config = (
+            f"SocksPort {self.socks_port}\n"
+            f"ControlPort {self.control_port}\n"
+            f"DataDirectory {self.data_dir}\n"
+            f"CookieAuthentication 0\n"
+            f"Log notice stderr\n"
+        )
+        with open(self.torrc_path, 'w') as f:
+            f.write(config)
+
+    def start(self) -> bool:
+        """Start Tor daemon. Returns True when ready."""
+        tor_bin = shutil.which("tor")
+        if not tor_bin:
+            print("[Tor] Binary not found")
+            return False
+        self.stop()
+        self._write_torrc()
+        print(f"[Tor] Starting (SOCKS5 port {self.socks_port})...")
+        sys.stdout.flush()
+        try:
+            self.process = subprocess.Popen(
+                [tor_bin, "-f", self.torrc_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+        except Exception as e:
+            print(f"[Tor] Failed to start: {e}")
+            return False
+        # Wait for Tor to bootstrap with non-blocking read
+        import fcntl
+        fd = self.process.stdout.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        buffer = b""
+        start_time = time.time()
+        timeout = 60  # Tor can take up to 60s to bootstrap
+        while time.time() - start_time < timeout:
+            if self.process.poll() is not None:
+                try:
+                    remaining = self.process.stdout.read()
+                    if remaining:
+                        buffer += remaining
+                except Exception:
+                    pass
+                print(f"[Tor] Process exited (code {self.process.returncode})")
+                if buffer:
+                    text = buffer.decode('utf-8', errors='ignore')
+                    lines = [l for l in text.split('\n') if l.strip()][-5:]
+                    for l in lines:
+                        print(f"[Tor] {l[:200]}")
+                sys.stdout.flush()
+                return False
+            ready, _, _ = select.select([fd], [], [], 1.0)
+            if ready:
+                try:
+                    data = os.read(fd, 65536)
+                    if data:
+                        buffer += data
+                        text = buffer.decode('utf-8', errors='ignore')
+                        if 'Bootstrapped 100%' in text:
+                            self.connected = True
+                            elapsed = time.time() - start_time
+                            print(f"[Tor] Connected in {elapsed:.1f}s (SOCKS5: {self.socks_port})")
+                            sys.stdout.flush()
+                            return True
+                        # Log bootstrap progress
+                        for line in text.split('\n'):
+                            if 'Bootstrapped' in line and '%' in line:
+                                pct = line.split('Bootstrapped')[1].split(':')[0].strip()
+                                print(f"[Tor] Bootstrap {pct}")
+                                sys.stdout.flush()
+                except OSError:
+                    pass
+        print(f"[Tor] Connection timeout after {timeout}s")
+        sys.stdout.flush()
+        self.stop()
+        return False
+
+    def stop(self):
+        if self.process:
+            try:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+            except Exception:
+                pass
+            self.process = None
+        self.connected = False
+
+    def get_proxy_url(self) -> Optional[str]:
+        if self.connected:
+            return f"socks5h://127.0.0.1:{self.socks_port}"
+        return None
+
+    def rotate_ip(self) -> bool:
+        """Get new Tor circuit (new exit IP) via control port."""
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(('127.0.0.1', self.control_port))
+            s.send(b'AUTHENTICATE ""\r\n')
+            resp = s.recv(256)
+            if b'250' not in resp:
+                # Try without password
+                s.close()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect(('127.0.0.1', self.control_port))
+                s.send(b'AUTHENTICATE\r\n')
+                resp = s.recv(256)
+            s.send(b'SIGNAL NEWNYM\r\n')
+            resp = s.recv(256)
+            s.close()
+            if b'250' in resp:
+                print(f"[Tor] New circuit requested (new IP in ~5s)")
+                sys.stdout.flush()
+                time.sleep(5)  # Wait for new circuit
+                return True
+            print(f"[Tor] NEWNYM failed: {resp}")
+            return False
+        except Exception as e:
+            print(f"[Tor] Circuit rotation error: {e}")
+            return False
+
+    def __del__(self):
+        self.stop()
+
+
 # --- Psiphon VPN Manager ------------------------------------------------
 
 class PsiphonManager:
@@ -397,7 +542,7 @@ class PsiphonManager:
 # --- IP Rotation Manager -----------------------------------------------
 
 class IPRotator:
-    """Manages IP rotation: direct -> Psiphon tunnels -> external proxies."""
+    """Manages IP rotation: direct -> Tor -> Psiphon -> external proxies."""
 
     def __init__(self):
         self.psiphon_instances: list = []
@@ -407,11 +552,17 @@ class IPRotator:
         self.current_external_idx = 0
         self.direct_exhausted = False
         self.psiphon_available = os.path.exists(PSIPHON_BINARY)
+        self.psiphon_failed = False  # Cache Psiphon failure
+        self.tor_manager: Optional[TorManager] = None
+        self.tor_available = shutil.which("tor") is not None
+        self.tor_failed = False
         self.rotation_count = 0
+        if self.tor_available:
+            print(f"[IPRotator] Tor found - free IP rotation available")
         if self.psiphon_available:
-            print(f"[IPRotator] Psiphon binary found - free IP rotation available")
-        else:
-            print(f"[IPRotator] Psiphon binary not found at {PSIPHON_BINARY}")
+            print(f"[IPRotator] Psiphon binary found - backup IP rotation available")
+        elif not self.tor_available:
+            print(f"[IPRotator] No proxy tools found (tor, psiphon)")
         if self.external_proxies:
             print(f"[IPRotator] {len(self.external_proxies)} external proxies configured")
         sys.stdout.flush()
@@ -425,6 +576,9 @@ class IPRotator:
     def get_current_proxy(self) -> Optional[str]:
         if self.current_mode == "direct":
             return None
+        elif self.current_mode == "tor":
+            if self.tor_manager:
+                return self.tor_manager.get_proxy_url()
         elif self.current_mode == "psiphon":
             if self.current_psiphon_idx < len(self.psiphon_instances):
                 return self.psiphon_instances[self.current_psiphon_idx].get_proxy_url()
@@ -436,6 +590,8 @@ class IPRotator:
     def get_proxy_label(self) -> str:
         if self.current_mode == "direct":
             return "direct"
+        elif self.current_mode == "tor":
+            return "tor"
         elif self.current_mode == "psiphon":
             return f"psiphon-{self.current_psiphon_idx}"
         elif self.current_mode == "external":
@@ -449,8 +605,29 @@ class IPRotator:
         sys.stdout.flush()
         if self.current_mode == "direct":
             self.direct_exhausted = True
-        # Try Psiphon rotation
-        if self.psiphon_available:
+        # Try Tor first (most reliable on cloud servers)
+        if self.tor_available and not self.tor_failed:
+            if self.current_mode == "tor" and self.tor_manager and self.tor_manager.connected:
+                # Already on Tor — rotate circuit for new IP
+                if self.tor_manager.rotate_ip():
+                    print(f"[IPRotator] Rotated Tor circuit (new exit IP)")
+                    sys.stdout.flush()
+                    return True
+            # Start Tor if not running
+            if not self.tor_manager:
+                self.tor_manager = TorManager()
+            if not self.tor_manager.connected:
+                if self.tor_manager.start():
+                    self.current_mode = "tor"
+                    print(f"[IPRotator] Rotated to tor")
+                    sys.stdout.flush()
+                    return True
+                else:
+                    self.tor_failed = True
+                    print(f"[IPRotator] Tor failed, will skip in future rotations")
+                    sys.stdout.flush()
+        # Try Psiphon (may not work on cloud servers)
+        if self.psiphon_available and not self.psiphon_failed:
             if self.current_mode == "psiphon" and self.current_psiphon_idx < len(self.psiphon_instances):
                 psiphon = self.psiphon_instances[self.current_psiphon_idx]
                 if psiphon.restart_for_new_ip():
@@ -458,9 +635,9 @@ class IPRotator:
                     print(f"[IPRotator] Rotated to {self.get_proxy_label()} (restarted)")
                     sys.stdout.flush()
                     return True
-            # Create new Psiphon instance (max 3)
+            # Create new Psiphon instance (max 1 attempt on cloud)
             idx = len(self.psiphon_instances)
-            if idx < 3:
+            if idx < 1:
                 psiphon = PsiphonManager(instance_id=idx)
                 if psiphon.start():
                     self.psiphon_instances.append(psiphon)
@@ -469,15 +646,10 @@ class IPRotator:
                     print(f"[IPRotator] Rotated to {self.get_proxy_label()} (new)")
                     sys.stdout.flush()
                     return True
-            # Restart instance 0 for new IP
-            if self.psiphon_instances:
-                psiphon = self.psiphon_instances[0]
-                if psiphon.restart_for_new_ip():
-                    self.current_psiphon_idx = 0
-                    self.current_mode = "psiphon"
-                    print(f"[IPRotator] Rotated to psiphon-0 (recycled)")
+                else:
+                    self.psiphon_failed = True
+                    print(f"[IPRotator] Psiphon failed, will skip in future rotations")
                     sys.stdout.flush()
-                    return True
         # Try external proxies
         if self.external_proxies:
             self.current_external_idx = (self.current_external_idx + 1) % len(self.external_proxies)
@@ -533,6 +705,9 @@ class IPRotator:
             return False
 
     def cleanup(self):
+        if self.tor_manager:
+            self.tor_manager.stop()
+            self.tor_manager = None
         for p in self.psiphon_instances:
             p.stop()
         self.psiphon_instances.clear()

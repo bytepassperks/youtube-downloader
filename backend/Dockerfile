@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# Install system dependencies
+# Install system dependencies including Tor for IP rotation
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends megatools curl && \
+    apt-get install -y --no-install-recommends megatools curl tor && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
