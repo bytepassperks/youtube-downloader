@@ -1206,13 +1206,23 @@ def _stream_parallel_download_upload(
     Each thread downloads its byte-range, decrypts in 8 MB streaming pieces,
     and uploads each piece as a separate S3 multipart part.  Zero disk usage.
     Memory: ~8 MB per thread = ~32 MB for 4 threads.  Works for ANY file size.
+
+    Uses only unique proxies to avoid Mega's per-IP concurrent connection
+    limit (duplicate proxy = 509 over quota).  Failed chunks are retried
+    sequentially after the parallel batch completes.
     """
-    num_chunks = min(len(proxies), PARALLEL_CHUNKS)
+    # De-duplicate proxies — Mega blocks multiple connections from same IP
+    unique_proxies = list(dict.fromkeys(p for p in proxies if p))
+    if not unique_proxies:
+        unique_proxies = [None]  # direct connection
+    num_chunks = min(len(unique_proxies), PARALLEL_CHUNKS)
     if num_chunks < 2:
-        num_chunks = PARALLEL_CHUNKS  # Always use parallel even with same proxy
-    # Extend proxies list if shorter than num_chunks
-    while len(proxies) < num_chunks:
-        proxies.append(proxies[0] if proxies else None)
+        # Only 1 unique proxy — fall back to single-stream
+        return _stream_download_and_upload(
+            dl_url, file_key, node_key, file_size, storage, remote_key,
+            proxy=unique_proxies[0],
+            speed_callback=speed_callback,
+        )
 
     upload_id = None
     try:
@@ -1226,19 +1236,25 @@ def _stream_parallel_download_upload(
         last_chunk_size = file_size - (num_chunks - 1) * chunk_size
         parts_last_chunk = (last_chunk_size + _MIN_PART_SIZE - 1) // _MIN_PART_SIZE + 1
 
-        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} threads (~8 MB/part) -> S3")
+        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} threads, {len(unique_proxies)} unique proxies (~8 MB/part) -> S3")
         sys.stdout.flush()
         start_time = time.time()
 
+        # Build chunk specs: (index, start_byte, end_byte, proxy, first_part)
+        chunk_specs = []
+        for i in range(num_chunks):
+            start_byte = i * chunk_size
+            end_byte = file_size - 1 if i == num_chunks - 1 else (i + 1) * chunk_size - 1
+            proxy = unique_proxies[i % len(unique_proxies)]
+            first_part = i * parts_per_chunk + 1
+            chunk_specs.append((i, start_byte, end_byte, proxy, first_part))
+
         results = [None] * num_chunks
+
+        # --- Phase 1: parallel download of all chunks ---
         with ThreadPoolExecutor(max_workers=num_chunks) as executor:
             futures = {}
-            for i in range(num_chunks):
-                start_byte = i * chunk_size
-                end_byte = file_size - 1 if i == num_chunks - 1 else (i + 1) * chunk_size - 1
-                proxy = proxies[i % len(proxies)]
-                # Assign non-overlapping part number ranges
-                first_part = i * parts_per_chunk + 1
+            for i, start_byte, end_byte, proxy, first_part in chunk_specs:
                 future = executor.submit(
                     _stream_chunk_and_upload_parts,
                     dl_url, file_key, node_key, file_size,
@@ -1257,6 +1273,26 @@ def _stream_parallel_download_upload(
                     print(f"[StreamParallel] Chunk {idx} exception: {e}")
                     results[idx] = []
 
+        # --- Phase 2: retry failed chunks sequentially ---
+        # After parallel phase completes, all other connections are closed,
+        # so retrying with the same proxy won't trigger Mega's per-IP limit.
+        failed = [i for i, r in enumerate(results) if not r]
+        if failed:
+            print(f"[StreamParallel] Retrying {len(failed)} failed chunks sequentially: {failed}")
+            sys.stdout.flush()
+            for idx in failed:
+                _, start_byte, end_byte, proxy, first_part = chunk_specs[idx]
+                print(f"[StreamParallel] Retry chunk {idx} ({(end_byte-start_byte+1)/(1024*1024):.1f} MB)")
+                sys.stdout.flush()
+                retry_result = _stream_chunk_and_upload_parts(
+                    dl_url, file_key, node_key, file_size,
+                    start_byte, end_byte,
+                    storage, remote_key, upload_id,
+                    first_part,
+                    proxy, idx,
+                )
+                results[idx] = retry_result
+
         elapsed = time.time() - start_time
         speed = (file_size / (1024 * 1024)) / max(elapsed, 0.1)
 
@@ -1274,8 +1310,8 @@ def _stream_parallel_download_upload(
                 speed_callback(file_size, file_size, speed)
             return True
         else:
-            failed = [i for i, r in enumerate(results) if not r]
-            print(f"[StreamParallel] Failed chunks: {failed}")
+            still_failed = [i for i, r in enumerate(results) if not r]
+            print(f"[StreamParallel] Still failed after retry: {still_failed}")
             sys.stdout.flush()
             storage.abort_multipart_upload(remote_key, upload_id)
             return False
