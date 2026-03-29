@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
 import { login } from "../lib/api";
 import { Lock, Mail } from "lucide-react";
 
@@ -8,7 +7,6 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -16,7 +14,8 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await login(email, password);
-      navigate("/");
+      // Full page reload to re-trigger useEffect in App.tsx
+      window.location.href = "/";
     } catch {
       setError("Invalid email or password");
     } finally {
