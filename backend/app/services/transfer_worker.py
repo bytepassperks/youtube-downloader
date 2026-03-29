@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import re
 import threading
@@ -35,7 +36,11 @@ def _upload_single_file(storage, local_file, remote_key, job_id, fname, relative
     """Upload a single file and record it in the database. Returns True on success."""
     try:
         file_size = os.path.getsize(local_file)
+        print(f"[Upload] Uploading {fname} ({file_size} bytes) -> {remote_key}")
+        sys.stdout.flush()
         storage.upload_file(local_file, remote_key)
+        print(f"[Upload] Uploaded {fname} successfully")
+        sys.stdout.flush()
 
         # Record in database
         conn = get_connection()
@@ -56,7 +61,10 @@ def _upload_single_file(storage, local_file, remote_key, job_id, fname, relative
 
         return True
     except Exception as e:
+        import traceback
         print(f"Failed to upload {fname}: {e}")
+        traceback.print_exc()
+        sys.stdout.flush()
         return False
 
 
@@ -107,6 +115,19 @@ def _run_transfer(job_id: int):
             )
 
         # Step 2: Upload to storage using parallel threads
+        print(f"[Job {job_id}] Download complete. Starting upload phase...")
+        print(f"[Job {job_id}] Download path: {download_path}")
+        print(f"[Job {job_id}] Download path exists: {os.path.exists(download_path)}")
+        if os.path.exists(download_path):
+            all_on_disk = []
+            for r, d, fs in os.walk(download_path):
+                for f in fs:
+                    all_on_disk.append(os.path.join(r, f))
+            print(f"[Job {job_id}] Files on disk: {len(all_on_disk)}")
+            for fp in all_on_disk[:10]:
+                print(f"  {fp} ({os.path.getsize(fp)} bytes)")
+        sys.stdout.flush()
+
         _update_job(job_id, status="uploading", progress=40)
         storage = get_storage(storage_target)
 
@@ -140,6 +161,7 @@ def _run_transfer(job_id: int):
         # Parallel upload using ThreadPoolExecutor
         uploaded = len(already_uploaded)
         print(f"[Upload] {len(files_to_upload)} files to upload, {len(already_uploaded)} already done")
+        sys.stdout.flush()
         with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
             futures = {}
             for local_file, remote_key, fname, relative in files_to_upload:
