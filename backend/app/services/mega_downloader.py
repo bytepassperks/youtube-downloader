@@ -54,7 +54,8 @@ RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
 # --- Mega Crypto Helpers ------------------------------------------------
 
 def _b64_decode(data: str) -> bytes:
-    data += '==' if len(data) % 4 == 2 else '=' if len(data) % 4 == 3 else ''
+    pad = (4 - len(data) % 4) % 4
+    data += '=' * pad
     return base64.urlsafe_b64decode(data)
 
 
