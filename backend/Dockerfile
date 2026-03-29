@@ -12,6 +12,18 @@ RUN curl -L -o /usr/local/bin/psiphon-tunnel-core \
     chmod +x /usr/local/bin/psiphon-tunnel-core && \
     mkdir -p /tmp/psiphon_datastore
 
+# Install wgcf (Cloudflare WARP account generator) + wireproxy (WireGuard SOCKS5 proxy)
+# These enable free Cloudflare WARP as a SOCKS5 proxy (50-200 Mbps, unlimited bandwidth)
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -L -o /usr/local/bin/wgcf \
+    "https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_${ARCH}" && \
+    chmod +x /usr/local/bin/wgcf && \
+    curl -L -o /tmp/wireproxy.tar.gz \
+    "https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_${ARCH}.tar.gz" && \
+    tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin/ wireproxy && \
+    chmod +x /usr/local/bin/wireproxy && \
+    rm -f /tmp/wireproxy.tar.gz
+
 RUN megadl --version || true
 
 WORKDIR /app
