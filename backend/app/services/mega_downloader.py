@@ -36,7 +36,12 @@ PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "4"))  # chunks per large fil
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB - files above this use parallel chunks
 # Max total memory for parallel chunks.  On a 2 GB plan, proxies + FastAPI
 # use ~500 MB, so we can safely use ~1.2 GB for parallel chunk buffers.
-_PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "1200")) * 1024 * 1024
+# Parallel streaming is DISABLED on 2 GB plans.  Each chunk buffer holds
+# file_size/num_chunks in RAM; 3 threads of a 1 GB file = 1 GB + proxies +
+# FastAPI overhead → OOM.  Single-stream uses only ~16 MB constant memory
+# and still achieves 10-16 MB/s via WARP.  Set to 0 to disable, or raise
+# on plans with more RAM (e.g. 2000 for Pro 4 GB plan).
+_PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "0")) * 1024 * 1024
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
 PSIPHON_BASE_SOCKS_PORT = 10800
 PSIPHON_BASE_HTTP_PORT = 10900
