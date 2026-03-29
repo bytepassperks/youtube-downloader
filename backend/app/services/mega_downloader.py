@@ -439,10 +439,10 @@ class TorManager:
 
     def __init__(self):
         self.process: Optional[subprocess.Popen] = None
-        self.socks_port = 9050
-        self.control_port = 9051
-        self.data_dir = "/tmp/tor_data"
-        self.torrc_path = "/tmp/torrc"
+        self.socks_port = 9150
+        self.control_port = 9151
+        self.data_dir = "/tmp/tor_data_new"
+        self.torrc_path = "/tmp/torrc_new"
         self.connected = False
 
     def _write_torrc(self):
@@ -873,8 +873,11 @@ def _download_chunk(
             if raw_chunk:
                 chunk_data += cipher.decrypt(raw_chunk)
 
-        # Write chunk to the correct position in file
-        with open(dest_path, 'r+b') as f:
+        # Ensure parent directory exists and write chunk to correct position
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        # Use 'r+b' if file exists (pre-allocated), else create it
+        mode = 'r+b' if os.path.exists(dest_path) else 'wb'
+        with open(dest_path, mode) as f:
             f.seek(start_byte)
             f.write(chunk_data)
 
