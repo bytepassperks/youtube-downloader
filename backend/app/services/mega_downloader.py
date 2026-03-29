@@ -998,70 +998,86 @@ class IPRotator:
         return [p.strip() for p in proxies_str.split(",") if p.strip()]
 
     def _warmup_proxies(self):
-        """Proactively start ALL proxy tools at init for parallel downloads.
+        """Proactively start proxy tools at init for parallel downloads.
 
         This ensures parallel chunk downloads have multiple proxies ready
         from the very first file, instead of waiting for quota hits.
+        Each tool is wrapped in try/except so a failure never crashes the job.
         """
-        print("[IPRotator] Warming up all proxy tools for parallel downloads...")
+        print("[IPRotator] Warming up proxy tools for parallel downloads...")
         sys.stdout.flush()
         started = 0
 
-        # Start up to 3 WARP instances (fastest)
+        # Try 1 WARP instance first (fastest, but may not work on all hosts)
         if self.warp_available:
-            for i in range(3):
-                warp = WARPManager(instance_id=i)
+            try:
+                warp = WARPManager(instance_id=0)
                 if warp.start():
                     self.warp_instances.append(warp)
                     started += 1
-                    print(f"[IPRotator] WARP-{i} ready (port {warp.socks_port})")
+                    self.current_mode = "warp"
+                    self.current_warp_idx = 0
+                    print(f"[IPRotator] WARP-0 ready (port {warp.socks_port})")
                 else:
-                    print(f"[IPRotator] WARP-{i} failed to start")
+                    self.warp_failed = True
+                    print(f"[IPRotator] WARP not available on this host")
+            except Exception as e:
+                self.warp_failed = True
+                print(f"[IPRotator] WARP init error: {e}")
+            sys.stdout.flush()
+
+        # Start multiple Psiphon instances for parallel channels
+        if self.psiphon_available:
+            for i in range(2):
+                try:
+                    psiphon = PsiphonManager(instance_id=i)
+                    if psiphon.start():
+                        self.psiphon_instances.append(psiphon)
+                        started += 1
+                        print(f"[IPRotator] Psiphon-{i} ready (port {psiphon.socks_port})")
+                        if self.current_mode == "direct":
+                            self.current_mode = "psiphon"
+                    else:
+                        print(f"[IPRotator] Psiphon-{i} failed")
+                        if i == 0:
+                            self.psiphon_failed = True
+                        break
+                except Exception as e:
+                    print(f"[IPRotator] Psiphon-{i} error: {e}")
+                    if i == 0:
+                        self.psiphon_failed = True
                     break
                 sys.stdout.flush()
-            if self.warp_instances:
-                self.current_mode = "warp"
-                self.current_warp_idx = 0
-            else:
-                self.warp_failed = True
-
-        # Start Psiphon (adds another parallel channel)
-        if self.psiphon_available:
-            psiphon = PsiphonManager(instance_id=0)
-            if psiphon.start():
-                self.psiphon_instances.append(psiphon)
-                started += 1
-                print(f"[IPRotator] Psiphon-0 ready (port {psiphon.socks_port})")
-                if not self.warp_instances:
-                    self.current_mode = "psiphon"
-            else:
-                print(f"[IPRotator] Psiphon-0 failed to start")
-                self.psiphon_failed = True
-            sys.stdout.flush()
 
         # Start Tor (adds another parallel channel)
         if self.tor_available:
-            self.tor_manager = TorManager()
-            if self.tor_manager.start():
-                started += 1
-                print(f"[IPRotator] Tor ready (port 9050)")
-                if not self.warp_instances and not self.psiphon_instances:
-                    self.current_mode = "tor"
-            else:
-                print(f"[IPRotator] Tor failed to start")
+            try:
+                self.tor_manager = TorManager()
+                if self.tor_manager.start():
+                    started += 1
+                    print(f"[IPRotator] Tor ready (port 9050)")
+                    if self.current_mode == "direct":
+                        self.current_mode = "tor"
+                else:
+                    print(f"[IPRotator] Tor failed to start")
+                    self.tor_failed = True
+            except Exception as e:
+                print(f"[IPRotator] Tor error: {e}")
                 self.tor_failed = True
             sys.stdout.flush()
 
-        # Pre-fetch free proxy pool
-        pool_count = self.free_proxy_pool.refresh()
-        if pool_count > 0:
-            started += 1
-            print(f"[IPRotator] Free proxy pool: {pool_count} proxies loaded")
+        # Pre-fetch free proxy pool (fast, just HTTP requests)
+        try:
+            pool_count = self.free_proxy_pool.refresh()
+            if pool_count > 0:
+                started += 1
+                print(f"[IPRotator] Free proxy pool: {pool_count} proxies loaded")
+        except Exception as e:
+            print(f"[IPRotator] Free pool error: {e}")
         sys.stdout.flush()
 
         all_proxies = self.get_all_proxies()
-        print(f"[IPRotator] Warmup complete: {started} proxy tools, {len(all_proxies)} total channels")
-        print(f"[IPRotator] Primary mode: {self.current_mode}")
+        print(f"[IPRotator] Warmup done: {started} tools, {len(all_proxies)} channels, mode={self.current_mode}")
         sys.stdout.flush()
 
     def get_current_proxy(self) -> Optional[str]:
