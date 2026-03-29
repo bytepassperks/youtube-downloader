@@ -964,6 +964,252 @@ def _parallel_download_file(
         return False
 
 
+# --- Streaming Download → Decrypt → Upload (zero disk) ----------------
+
+# Minimum S3 multipart part size (5 MB).  We buffer decrypted data in
+# memory until we have at least this much, then upload as a part.
+_MIN_PART_SIZE = 8 * 1024 * 1024  # 8 MB (above the 5 MB minimum)
+
+
+def _stream_download_and_upload(
+    dl_url: str, file_key: tuple, node_key: tuple,
+    file_size: int, storage, remote_key: str,
+    proxy: str = None, timeout: int = 3600,
+    speed_callback=None,
+) -> bool:
+    """Download from Mega, decrypt in memory, upload to S3 via multipart.
+
+    Memory usage: ~8-16 MB buffer.  Disk usage: 0.
+    Works for any file size including 100 GB+.
+    """
+    upload_id = None
+    try:
+        proxies = {'http': proxy, 'https': proxy} if proxy else None
+        resp = requests.get(dl_url, stream=True, proxies=proxies,
+                            timeout=(30, timeout))
+        if resp.status_code == 509:
+            print(f"[StreamUpload] 509 over quota")
+            return False
+        if resp.status_code != 200:
+            print(f"[StreamUpload] HTTP {resp.status_code}")
+            return False
+
+        iv = _get_file_iv(node_key)
+        initial_value = int.from_bytes(_a32_to_str(iv), 'big')
+        ctr = CryptoCounter.new(128, initial_value=initial_value)
+        cipher = AES.new(_a32_to_str(file_key), AES.MODE_CTR, counter=ctr)
+
+        upload_id = storage.create_multipart_upload(remote_key)
+        parts = []
+        part_number = 1
+        buf = bytearray()
+        downloaded = 0
+        start_time = time.time()
+        last_report = start_time
+
+        for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+            if not chunk:
+                continue
+            decrypted = cipher.decrypt(chunk)
+            # Trim padding on last chunk
+            downloaded += len(chunk)
+            if downloaded >= file_size:
+                overflow = downloaded - file_size
+                if overflow > 0:
+                    decrypted = decrypted[:len(decrypted) - overflow]
+            buf.extend(decrypted)
+
+            # Flush buffer as S3 part when large enough
+            if len(buf) >= _MIN_PART_SIZE:
+                etag = storage.upload_part(
+                    remote_key, upload_id, part_number, bytes(buf),
+                )
+                parts.append({"PartNumber": part_number, "ETag": etag})
+                part_number += 1
+                buf.clear()
+
+            now = time.time()
+            if speed_callback and (now - last_report) >= 1.0:
+                elapsed = now - start_time
+                speed_mbps = (downloaded / (1024 * 1024)) / max(elapsed, 0.1)
+                speed_callback(downloaded, file_size, speed_mbps)
+                last_report = now
+
+        # Upload remaining buffer as final part
+        if buf:
+            etag = storage.upload_part(
+                remote_key, upload_id, part_number, bytes(buf),
+            )
+            parts.append({"PartNumber": part_number, "ETag": etag})
+
+        storage.complete_multipart_upload(remote_key, upload_id, parts)
+        elapsed = time.time() - start_time
+        speed = (file_size / (1024 * 1024)) / max(elapsed, 0.1)
+        print(f"[StreamUpload] {file_size/(1024*1024):.1f} MB streamed in {elapsed:.1f}s ({speed:.1f} MB/s)")
+        sys.stdout.flush()
+        if speed_callback:
+            speed_callback(file_size, file_size, speed)
+        return True
+    except requests.exceptions.ConnectionError as e:
+        print(f"[StreamUpload] Connection error: {e}")
+        if upload_id:
+            storage.abort_multipart_upload(remote_key, upload_id)
+        return False
+    except requests.exceptions.Timeout:
+        print(f"[StreamUpload] Timeout")
+        if upload_id:
+            storage.abort_multipart_upload(remote_key, upload_id)
+        return False
+    except Exception as e:
+        print(f"[StreamUpload] Error: {e}")
+        sys.stdout.flush()
+        if upload_id:
+            storage.abort_multipart_upload(remote_key, upload_id)
+        return False
+
+
+def _stream_chunk_and_upload_part(
+    dl_url: str, file_key: tuple, node_key: tuple,
+    file_size: int, start_byte: int, end_byte: int,
+    storage, remote_key: str, upload_id: str, part_number: int,
+    proxy: str = None, chunk_id: int = 0,
+) -> dict:
+    """Download a byte-range from Mega, decrypt, upload as one S3 part.
+
+    Returns {"PartNumber": N, "ETag": "..."} on success, or None on failure.
+    Memory: holds only the decrypted chunk (~file_size/num_chunks).
+    Disk: 0.
+    """
+    try:
+        proxies = {'http': proxy, 'https': proxy} if proxy else None
+        headers = {'Range': f'bytes={start_byte}-{end_byte}'}
+        resp = requests.get(
+            dl_url, stream=True, proxies=proxies,
+            headers=headers, timeout=(30, 3600),
+        )
+        if resp.status_code == 509:
+            print(f"[StreamChunk-{chunk_id}] 509 over quota")
+            return None
+        if resp.status_code not in (200, 206):
+            print(f"[StreamChunk-{chunk_id}] HTTP {resp.status_code}")
+            return None
+
+        iv = _get_file_iv(node_key)
+        initial_value = int.from_bytes(_a32_to_str(iv), 'big')
+        block_offset = start_byte // 16
+        ctr_value = initial_value + block_offset
+        ctr = CryptoCounter.new(128, initial_value=ctr_value)
+        cipher = AES.new(_a32_to_str(file_key), AES.MODE_CTR, counter=ctr)
+
+        sub_offset = start_byte % 16
+        if sub_offset > 0:
+            cipher.decrypt(b'\x00' * sub_offset)
+
+        expected_len = end_byte - start_byte + 1
+        buf = bytearray()
+        for raw in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+            if raw:
+                buf.extend(cipher.decrypt(raw))
+
+        # Trim to expected length (Mega pads to AES block boundary on last chunk)
+        if len(buf) > expected_len:
+            buf = buf[:expected_len]
+        # Also trim if this is the very last chunk and extends past file_size
+        if end_byte >= file_size - 1 and start_byte + len(buf) > file_size:
+            buf = buf[:file_size - start_byte]
+
+        chunk_mb = len(buf) / (1024 * 1024)
+        print(f"[StreamChunk-{chunk_id}] Downloaded {chunk_mb:.1f} MB, uploading part {part_number}...")
+        sys.stdout.flush()
+
+        etag = storage.upload_part(remote_key, upload_id, part_number, bytes(buf))
+        print(f"[StreamChunk-{chunk_id}] Part {part_number} uploaded ({chunk_mb:.1f} MB)")
+        sys.stdout.flush()
+        return {"PartNumber": part_number, "ETag": etag}
+    except Exception as e:
+        print(f"[StreamChunk-{chunk_id}] Error: {e}")
+        sys.stdout.flush()
+        return None
+
+
+def _stream_parallel_download_upload(
+    dl_url: str, file_key: tuple, node_key: tuple,
+    file_size: int, proxies: list, storage, remote_key: str,
+    speed_callback=None,
+) -> bool:
+    """Parallel chunk download from Mega → decrypt → upload parts to S3.
+
+    Each chunk downloads through a different proxy, decrypts in memory,
+    and uploads as an S3 multipart part.  Zero disk usage.
+    Memory: ~chunk_size per thread (file_size / num_chunks).
+    """
+    num_chunks = min(len(proxies), PARALLEL_CHUNKS)
+    if num_chunks < 2:
+        return _stream_download_and_upload(
+            dl_url, file_key, node_key, file_size, storage, remote_key,
+            proxy=proxies[0] if proxies else None,
+            speed_callback=speed_callback,
+        )
+
+    upload_id = None
+    try:
+        upload_id = storage.create_multipart_upload(remote_key)
+        chunk_size = file_size // num_chunks
+
+        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} chunks -> S3")
+        sys.stdout.flush()
+        start_time = time.time()
+
+        results = [None] * num_chunks
+        with ThreadPoolExecutor(max_workers=num_chunks) as executor:
+            futures = {}
+            for i in range(num_chunks):
+                start_byte = i * chunk_size
+                end_byte = file_size - 1 if i == num_chunks - 1 else (i + 1) * chunk_size - 1
+                proxy = proxies[i % len(proxies)]
+                future = executor.submit(
+                    _stream_chunk_and_upload_part,
+                    dl_url, file_key, node_key, file_size,
+                    start_byte, end_byte,
+                    storage, remote_key, upload_id,
+                    i + 1,  # part_number (1-based)
+                    proxy, i,
+                )
+                futures[future] = i
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    print(f"[StreamParallel] Chunk {idx} exception: {e}")
+                    results[idx] = None
+
+        elapsed = time.time() - start_time
+        speed = (file_size / (1024 * 1024)) / max(elapsed, 0.1)
+
+        if all(r is not None for r in results):
+            parts = sorted(results, key=lambda p: p["PartNumber"])
+            storage.complete_multipart_upload(remote_key, upload_id, parts)
+            print(f"[StreamParallel] Complete: {file_size/(1024*1024):.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s)")
+            sys.stdout.flush()
+            if speed_callback:
+                speed_callback(file_size, file_size, speed)
+            return True
+        else:
+            failed = [i for i, r in enumerate(results) if r is None]
+            print(f"[StreamParallel] Failed chunks: {failed}")
+            sys.stdout.flush()
+            storage.abort_multipart_upload(remote_key, upload_id)
+            return False
+    except Exception as e:
+        print(f"[StreamParallel] Error: {e}")
+        sys.stdout.flush()
+        if upload_id:
+            storage.abort_multipart_upload(remote_key, upload_id)
+        return False
+
+
 # --- IP Rotation Manager -----------------------------------------------
 
 class IPRotator:
@@ -1606,6 +1852,245 @@ class MegaDownloader:
             attempts += 1
             if os.path.exists(dest_path):
                 os.remove(dest_path)
+        return False
+
+    # --- Streaming mode: Mega → decrypt → S3 (zero disk) ----------------
+
+    def stream_folder(
+        self,
+        mega_link: str,
+        job_id: int,
+        storage,
+        remote_prefix: str,
+        excluded_files: list = None,
+        file_uploaded_callback=None,
+    ) -> int:
+        """Stream all files from a Mega folder directly to S3 storage.
+
+        Downloads each file from Mega, decrypts in memory, and uploads
+        via S3 multipart upload — **zero disk usage**.  Handles any file
+        size including 100 GB+.
+
+        Args:
+            storage: An IDriveStorage (or compatible) instance.
+            remote_prefix: S3 key prefix (e.g. "slug/subfolder").
+            file_uploaded_callback: Called after each file is uploaded.
+                Signature: callback(remote_key, file_name, relative_path, file_size)
+        Returns:
+            Number of files successfully uploaded.
+        """
+        if excluded_files is None:
+            excluded_files = []
+
+        self._update_job_status(job_id, status="downloading", progress=5,
+                                current_file="Listing folder contents...")
+
+        ip_rotator = None
+        try:
+            folder_id, folder_key = _parse_folder_link(mega_link)
+            print(f"[StreamFolder] Folder ID: {folder_id}")
+            sys.stdout.flush()
+
+            all_files = _list_folder_files(folder_id, folder_key)
+            print(f"[StreamFolder] Found {len(all_files)} files")
+            sys.stdout.flush()
+
+            # Filter excluded files
+            files_to_download = []
+            for f in all_files:
+                skip = False
+                for excluded in excluded_files:
+                    if excluded.strip() and excluded.strip().lower() in f['name'].lower():
+                        print(f"[Exclude] Skipping: {f['name']}")
+                        skip = True
+                        break
+                if not skip:
+                    files_to_download.append(f)
+
+            total_files = len(files_to_download)
+            total_size = sum(f['size'] for f in files_to_download)
+            total_size_mb = total_size / (1024 * 1024)
+            print(f"[StreamFolder] {total_files} files ({total_size_mb:.1f} MB)")
+            sys.stdout.flush()
+
+            self._update_job_status(
+                job_id, total_files=total_files,
+                current_file=f"Streaming {total_files} files ({total_size_mb:.1f} MB) to storage",
+            )
+
+            ip_rotator = IPRotator()
+            uploaded = 0
+            uploaded_bytes = 0
+            failed_files = []
+            start_time = time.time()
+
+            for i, file_info in enumerate(files_to_download):
+                fpath = file_info['path']
+                fsize = file_info['size']
+                fsize_mb = fsize / (1024 * 1024)
+                remote_key = f"{remote_prefix}/{fpath}"
+
+                print(f"[Stream {i+1}/{total_files}] {fpath} ({fsize_mb:.2f} MB)")
+                sys.stdout.flush()
+
+                elapsed = time.time() - start_time
+                avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
+                self._update_job_status(
+                    job_id,
+                    current_file=f"Streaming: {file_info['name']} ({fsize_mb:.2f} MB)",
+                    download_speed=f"{avg_speed:.1f} MB/s",
+                    downloaded_files=uploaded,
+                    progress=5 + int(85 * uploaded / max(total_files, 1)),
+                )
+
+                def make_speed_cb(fname):
+                    def cb(dl_bytes, total, speed_mbps):
+                        pct = int(100 * dl_bytes / max(total, 1))
+                        self._update_job_status(
+                            job_id,
+                            current_file=f"Streaming: {fname} ({pct}% @ {speed_mbps:.1f} MB/s)",
+                            download_speed=f"{speed_mbps:.1f} MB/s",
+                        )
+                    return cb
+
+                success = self._stream_single_file(
+                    file_info, folder_id, ip_rotator, storage, remote_key,
+                    speed_callback=make_speed_cb(file_info['name']),
+                    use_parallel=(fsize >= LARGE_FILE_THRESHOLD),
+                )
+
+                if success:
+                    uploaded += 1
+                    uploaded_bytes += fsize
+                    elapsed = time.time() - start_time
+                    avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
+                    self._update_job_status(
+                        job_id,
+                        downloaded_files=uploaded,
+                        uploaded_files=uploaded,
+                        progress=5 + int(85 * uploaded / max(total_files, 1)),
+                        download_speed=f"{avg_speed:.1f} MB/s",
+                        upload_speed=f"{avg_speed:.1f} MB/s",
+                        current_file=f"Streamed {uploaded}/{total_files} ({avg_speed:.1f} MB/s avg)",
+                    )
+                    if file_uploaded_callback:
+                        try:
+                            file_uploaded_callback(remote_key, file_info['name'], fpath, fsize)
+                        except Exception as cb_err:
+                            print(f"[file_uploaded_callback] Error: {cb_err}")
+                            sys.stdout.flush()
+                else:
+                    failed_files.append(file_info)
+                    print(f"  Failed to stream after all retries")
+                    sys.stdout.flush()
+
+            # Retry failed files once more
+            if failed_files:
+                print(f"[StreamFolder] Retrying {len(failed_files)} failed files...")
+                sys.stdout.flush()
+                for file_info in failed_files:
+                    remote_key = f"{remote_prefix}/{file_info['path']}"
+                    if self._stream_single_file(
+                        file_info, folder_id, ip_rotator, storage, remote_key,
+                        speed_callback=make_speed_cb(file_info['name']),
+                    ):
+                        uploaded += 1
+                        uploaded_bytes += file_info['size']
+                        if file_uploaded_callback:
+                            try:
+                                file_uploaded_callback(
+                                    remote_key, file_info['name'],
+                                    file_info['path'], file_info['size'],
+                                )
+                            except Exception:
+                                pass
+
+            ip_rotator.cleanup()
+
+            elapsed = time.time() - start_time
+            avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
+            print(f"[StreamFolder] Done: {uploaded}/{total_files} files "
+                  f"({uploaded_bytes/(1024*1024):.1f} MB in {elapsed:.0f}s, {avg_speed:.1f} MB/s)")
+            sys.stdout.flush()
+            self._update_job_status(
+                job_id, downloaded_files=uploaded, uploaded_files=uploaded,
+                total_files=total_files,
+                current_file=f"Stream complete: {uploaded}/{total_files} ({avg_speed:.1f} MB/s avg)",
+                download_speed=f"{avg_speed:.1f} MB/s",
+                upload_speed=f"{avg_speed:.1f} MB/s",
+            )
+            return uploaded
+
+        except Exception as e:
+            if ip_rotator:
+                ip_rotator.cleanup()
+            raise
+
+    def _stream_single_file(
+        self, file_info: dict, folder_id: str,
+        ip_rotator: IPRotator, storage, remote_key: str,
+        max_attempts: int = 15, speed_callback=None,
+        use_parallel: bool = False,
+    ) -> bool:
+        """Stream a single file: Mega → decrypt → S3.  Zero disk."""
+        attempts = 0
+        while attempts < max_attempts:
+            proxy = ip_rotator.get_current_proxy()
+            proxy_label = ip_rotator.get_proxy_label()
+
+            dl_url = _get_download_url(file_info['handle'], folder_id, proxy=proxy)
+            if dl_url is None:
+                print(f"  Quota hit on {proxy_label}, rotating IP...")
+                sys.stdout.flush()
+                if not ip_rotator.rotate():
+                    return False
+                attempts += 1
+                continue
+
+            # Try parallel streaming for large files
+            if use_parallel and file_info['size'] >= LARGE_FILE_THRESHOLD:
+                all_proxies = ip_rotator.get_all_proxies()
+                if len(all_proxies) >= 2:
+                    print(f"  Stream-parallel ({len(all_proxies)} proxies) -> S3 via {proxy_label}...")
+                    sys.stdout.flush()
+                    success = _stream_parallel_download_upload(
+                        dl_url=dl_url,
+                        file_key=file_info['file_key'],
+                        node_key=file_info['node_key'],
+                        file_size=file_info['size'],
+                        proxies=all_proxies,
+                        storage=storage,
+                        remote_key=remote_key,
+                        speed_callback=speed_callback,
+                    )
+                    if success:
+                        fsize_mb = file_info['size'] / (1024 * 1024)
+                        print(f"  OK ({fsize_mb:.2f} MB stream-parallel)")
+                        sys.stdout.flush()
+                        return True
+
+            # Single-stream fallback
+            success = _stream_download_and_upload(
+                dl_url=dl_url,
+                file_key=file_info['file_key'],
+                node_key=file_info['node_key'],
+                file_size=file_info['size'],
+                storage=storage,
+                remote_key=remote_key,
+                proxy=proxy,
+                speed_callback=speed_callback,
+            )
+            if success:
+                fsize_mb = file_info['size'] / (1024 * 1024)
+                print(f"  OK ({fsize_mb:.2f} MB streamed via {proxy_label})")
+                sys.stdout.flush()
+                return True
+
+            print(f"  Stream failed on {proxy_label}, rotating IP...")
+            sys.stdout.flush()
+            if not ip_rotator.rotate():
+                return False
+            attempts += 1
         return False
 
     def _update_job_status(self, job_id: int, **kwargs):

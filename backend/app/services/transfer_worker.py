@@ -78,11 +78,11 @@ def _upload_single_file(storage, local_file, remote_key, job_id, fname, relative
 
 
 def _run_transfer(job_id: int):
-    """Main transfer pipeline: download -> exclude -> upload (parallel) -> notify.
+    """Main transfer pipeline: stream Mega → decrypt → S3 (zero disk) → notify.
 
-    Supports resuming interrupted jobs:
-    - If job was 'uploading', skip download and go straight to upload from /data
-    - If job was 'downloading', re-download (with file-level resume support)
+    Uses streaming mode by default: files are downloaded from Mega, decrypted
+    in memory, and uploaded directly to S3 via multipart upload.  Zero disk
+    usage — supports any file size including 100 GB+.
     """
     global _current_job_id
 
@@ -110,15 +110,11 @@ def _run_transfer(job_id: int):
     storage_target = job["storage_target"]
     title = job["title"]
     slug = job["download_slug"]
-    previous_status = job["status"]
 
     downloader = MegaDownloader()
-    download_path = os.path.join(downloader.download_base, str(job_id))
+    storage = get_storage(storage_target)
 
     try:
-        # Prepare storage for inline upload during download
-        storage = get_storage(storage_target)
-
         # Check which files have already been uploaded (for resume support)
         conn = get_connection()
         already_uploaded = set()
@@ -129,93 +125,59 @@ def _run_transfer(job_id: int):
         for row in rows:
             already_uploaded.add(row["file_path"])
 
-        uploaded = len(already_uploaded)
-        uploaded_bytes = 0
-        upload_start_time = time.time()
+        uploaded_count = len(already_uploaded)
+        start_time = time.time()
 
-        def _on_file_done(local_path, relative_path, file_name, file_size):
-            """Called after each file downloads — upload to storage + delete local."""
-            nonlocal uploaded, uploaded_bytes
+        def _on_file_uploaded(remote_key, file_name, relative_path, file_size):
+            """Record each streamed file in the database."""
+            nonlocal uploaded_count
             if relative_path in already_uploaded:
                 return
-            remote_key = f"{slug}/{relative_path}"
-            if _upload_single_file(
-                storage, local_path, remote_key, job_id,
-                file_name, relative_path, storage_target,
-            ):
-                uploaded += 1
-                uploaded_bytes += file_size
-                elapsed = time.time() - upload_start_time
-                avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
-                _update_job(
-                    job_id, uploaded_files=uploaded,
-                    current_file=f"Uploaded: {file_name} ({uploaded} done)",
-                    upload_speed=f"{avg_speed:.1f} MB/s",
+            try:
+                conn2 = get_connection()
+                conn2.execute(
+                    """INSERT INTO content_items
+                       (job_id, file_name, file_path, storage_key, storage_target, file_size)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (job_id, file_name, relative_path, remote_key, storage_target, file_size),
                 )
+                conn2.commit()
+                conn2.close()
+                uploaded_count += 1
+                elapsed = time.time() - start_time
+                speed = (file_size / (1024 * 1024)) / max(elapsed, 0.1)
+                print(f"[Upload] Recorded {file_name} ({uploaded_count} done, {speed:.1f} MB/s)")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"[Upload] DB record error for {file_name}: {e}")
+                sys.stdout.flush()
 
-        # Step 1: Download from Mega with inline upload per file
-        if previous_status == "uploading" and os.path.exists(download_path):
-            file_count = _count_files(download_path)
-            if file_count > 0:
-                print(f"[Resume] Job {job_id}: Skipping download, {file_count} files already on disk")
-                # Upload any remaining files on disk
-                for root, dirs, files in os.walk(download_path):
-                    for fname in files:
-                        if fname.startswith('.'):
-                            continue
-                        local_file = os.path.join(root, fname)
-                        relative = os.path.relpath(local_file, download_path)
-                        if relative in already_uploaded:
-                            continue
-                        _on_file_done(local_file, relative, fname, os.path.getsize(local_file))
-            else:
-                print(f"[Resume] Job {job_id}: No files on disk despite uploading status, re-downloading")
-                _update_job(job_id, status="downloading", progress=10, error_message="")
-                download_path = downloader.download_folder(
-                    mega_link=job["mega_link"],
-                    job_id=job_id,
-                    excluded_files=excluded_files,
-                    file_done_callback=_on_file_done,
-                )
-        else:
-            _update_job(job_id, status="downloading", progress=10, error_message="")
-            download_path = downloader.download_folder(
-                mega_link=job["mega_link"],
-                job_id=job_id,
-                excluded_files=excluded_files,
-                file_done_callback=_on_file_done,
-            )
-
-        # Step 2: Upload any files still on disk (fallback for callback failures)
-        print(f"[Job {job_id}] Download complete. Checking for remaining uploads...")
+        # Stream: Mega → decrypt in memory → S3 multipart upload (zero disk)
+        print(f"[Job {job_id}] Starting streaming transfer (zero disk mode)")
         sys.stdout.flush()
-        if os.path.exists(download_path):
-            for root, dirs, files in os.walk(download_path):
-                for fname in files:
-                    if fname.startswith('.'):
-                        continue
-                    local_file = os.path.join(root, fname)
-                    relative = os.path.relpath(local_file, download_path)
-                    if relative in already_uploaded:
-                        continue
-                    _on_file_done(local_file, relative, fname, os.path.getsize(local_file))
+        total_uploaded = downloader.stream_folder(
+            mega_link=job["mega_link"],
+            job_id=job_id,
+            storage=storage,
+            remote_prefix=slug,
+            excluded_files=excluded_files,
+            file_uploaded_callback=_on_file_uploaded,
+        )
 
-        # Step 3: Mark complete
-        total = uploaded
-        total_elapsed = time.time() - upload_start_time
-        final_speed = (uploaded_bytes / (1024 * 1024)) / max(total_elapsed, 0.1)
+        # Mark complete
+        total_elapsed = time.time() - start_time
         _update_job(
             job_id,
             status="completed",
             progress=100,
-            uploaded_files=uploaded,
-            total_files=total,
+            uploaded_files=total_uploaded,
+            total_files=total_uploaded,
             completed_at=datetime.utcnow().isoformat(),
-            current_file=f"Complete: {uploaded} files uploaded",
-            upload_speed=f"{final_speed:.1f} MB/s",
+            current_file=f"Complete: {total_uploaded} files streamed to storage",
+            upload_speed=f"{total_uploaded / max(total_elapsed / 60, 0.01):.0f} files/min",
         )
 
-        # Step 4: Send Telegram notification
+        # Send Telegram notification
         try:
             portal_url = f"{settings.PORTAL_BASE_URL}/content/{slug}"
             bot = TelegramBot()
@@ -224,12 +186,10 @@ def _run_transfer(job_id: int):
         except Exception as e:
             print(f"Telegram notification failed: {e}")
 
-        # Step 5: Cleanup local files
-        downloader.cleanup(job_id)
-
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         _update_job(job_id, status="failed", error_message=str(e))
-        downloader.cleanup(job_id)
     finally:
         _current_job_id = None
         _transfer_lock.release()

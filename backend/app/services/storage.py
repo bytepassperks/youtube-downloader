@@ -38,6 +38,53 @@ class IDriveStorage:
         )
         return remote_key
 
+    # --- Streaming multipart upload (zero disk) ---
+
+    def create_multipart_upload(self, remote_key: str) -> str:
+        """Start a multipart upload and return the upload ID."""
+        resp = self.client.create_multipart_upload(
+            Bucket=self.bucket, Key=remote_key,
+        )
+        return resp["UploadId"]
+
+    def upload_part(self, remote_key: str, upload_id: str,
+                    part_number: int, data: bytes) -> str:
+        """Upload a single part and return its ETag."""
+        resp = self.client.upload_part(
+            Bucket=self.bucket, Key=remote_key,
+            UploadId=upload_id, PartNumber=part_number,
+            Body=data,
+        )
+        return resp["ETag"]
+
+    def complete_multipart_upload(self, remote_key: str, upload_id: str,
+                                  parts: list[dict]) -> str:
+        """Finish a multipart upload.  *parts* is a list of
+        ``{"PartNumber": int, "ETag": str}`` dicts."""
+        self.client.complete_multipart_upload(
+            Bucket=self.bucket, Key=remote_key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+        return remote_key
+
+    def abort_multipart_upload(self, remote_key: str, upload_id: str):
+        """Cancel a multipart upload and discard uploaded parts."""
+        try:
+            self.client.abort_multipart_upload(
+                Bucket=self.bucket, Key=remote_key, UploadId=upload_id,
+            )
+        except Exception:
+            pass
+
+    def upload_fileobj(self, fileobj, remote_key: str) -> str:
+        """Upload from a file-like object (supports streaming)."""
+        self.client.upload_fileobj(
+            fileobj, self.bucket, remote_key,
+            Config=MULTIPART_CONFIG,
+        )
+        return remote_key
+
     def generate_signed_url(self, remote_key: str, expiry: int = None) -> str:
         if expiry is None:
             expiry = settings.SIGNED_URL_EXPIRY
