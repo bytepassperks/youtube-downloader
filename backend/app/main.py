@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -26,6 +28,10 @@ app.include_router(portal.router)
 
 @app.on_event("startup")
 async def startup():
+    # Clean up old downloads FIRST to free disk space
+    # (prevents sqlite3.OperationalError: disk I/O error when disk is full)
+    _cleanup_disk_before_db()
+
     init_db()
     # Create or update default admin
     conn = get_connection()
@@ -70,6 +76,24 @@ async def startup():
         job_id = row["id"]
         print(f"[Startup] Resuming latest job {job_id}")
         process_transfer_job(job_id)
+
+
+def _cleanup_disk_before_db():
+    """Free disk space before SQLite init to prevent disk I/O errors."""
+    import shutil
+    download_base = "/data/mega_downloads"
+    if os.path.isdir(download_base):
+        try:
+            size = sum(
+                os.path.getsize(os.path.join(d, f))
+                for d, _, files in os.walk(download_base)
+                for f in files
+            )
+            shutil.rmtree(download_base, ignore_errors=True)
+            os.makedirs(download_base, exist_ok=True)
+            print(f"[Startup] Freed {size / (1024*1024):.1f} MB from old downloads")
+        except Exception as e:
+            print(f"[Startup] Disk cleanup warning: {e}")
 
 
 def _kill_stale_processes():
