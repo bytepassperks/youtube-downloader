@@ -26,7 +26,7 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
 PSIPHON_BASE_SOCKS_PORT = 10800
 PSIPHON_BASE_HTTP_PORT = 10900
-PSIPHON_CONNECT_TIMEOUT = 30
+PSIPHON_CONNECT_TIMEOUT = 60
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
 
@@ -450,11 +450,24 @@ class PsiphonManager:
             "LocalSocksProxyPort": self.socks_port,
             "PropagationChannelId": "FFFFFFFFFFFFFFFF",
             "RemoteServerListDownloadFilename": f"{self.data_dir}/server_list",
-            "RemoteServerListSignaturePublicKey": "",
-            "RemoteServerListUrl": "",
+            "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
+            "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+            "ObfuscatedServerListRootURL": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/",
             "SponsorId": "FFFFFFFFFFFFFFFF",
             "UseIndistinguishableTLS": True,
             "DataStoreDirectory": self.data_dir,
+            # Approach 1: Force domain-fronted meek protocols that bypass cloud
+            # network restrictions by routing through major CDNs (Cloudflare,
+            # Akamai, Azure). Falls back to TLS-OSSH if meek unavailable.
+            "LimitTunnelProtocols": [
+                "FRONTED-MEEK-OSSH",
+                "FRONTED-MEEK-HTTP-OSSH",
+                "FRONTED-MEEK-QUIC-OSSH",
+                "TLS-OSSH",
+                "UNFRONTED-MEEK-HTTPS-OSSH",
+                "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+            ],
+            "EstablishTunnelTimeoutSeconds": 60,
         }
         with open(self.config_path, 'w') as f:
             json.dump(config, f)
@@ -655,9 +668,9 @@ class IPRotator:
                     print(f"[IPRotator] Rotated to {self.get_proxy_label()} (restarted)")
                     sys.stdout.flush()
                     return True
-            # Create new Psiphon instance (max 1 attempt on cloud)
+            # Create new Psiphon instance (max 3 attempts with fixed config)
             idx = len(self.psiphon_instances)
-            if idx < 1:
+            if idx < 3:
                 psiphon = PsiphonManager(instance_id=idx)
                 if psiphon.start():
                     self.psiphon_instances.append(psiphon)
