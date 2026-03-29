@@ -44,18 +44,50 @@ async def startup():
         )
     conn.commit()
 
-    # Resume jobs that were interrupted mid-process (not failed/queued ones
-    # to avoid restart loops when quota is exhausted)
+    # Kill all stale proxy processes from previous deploys
+    _kill_stale_processes()
+
+    # Resume ONLY the latest incomplete job (not all — prevents duplicates)
     from app.services.transfer_worker import process_transfer_job
     incomplete = conn.execute(
-        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading')"
+        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading') ORDER BY id DESC LIMIT 1"
     ).fetchall()
+    # Mark all OTHER incomplete jobs as failed to prevent future resume
+    all_incomplete = conn.execute(
+        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading') ORDER BY id DESC"
+    ).fetchall()
+    for i, row in enumerate(all_incomplete):
+        if i > 0:  # Skip the latest one
+            conn.execute(
+                "UPDATE transfer_jobs SET status = 'failed', error_message = 'Cancelled: superseded by newer job' WHERE id = ?",
+                (row["id"],)
+            )
+            print(f"[Startup] Cancelled stale job {row['id']}")
+    conn.commit()
     conn.close()
 
     for row in incomplete:
         job_id = row["id"]
-        print(f"[Startup] Resuming interrupted job {job_id}")
+        print(f"[Startup] Resuming latest job {job_id}")
         process_transfer_job(job_id)
+
+
+def _kill_stale_processes():
+    """Kill all stale proxy processes from previous deploys."""
+    import subprocess
+    for cmd in [
+        ["killall", "-9", "wireproxy"],
+        ["killall", "-9", "tor"],
+        ["killall", "-9", "psiphon-tunnel-core"],
+    ]:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
+    # Wait for ports to be released
+    import time
+    time.sleep(2)
+    print("[Startup] Killed all stale proxy processes")
 
 
 @app.get("/healthz")

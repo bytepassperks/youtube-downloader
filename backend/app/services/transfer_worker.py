@@ -4,6 +4,7 @@ import json
 import re
 import time
 import threading
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -15,6 +16,10 @@ from app.config import settings
 
 # Number of parallel upload threads
 UPLOAD_WORKERS = 4
+
+# Global lock to prevent concurrent downloads
+_transfer_lock = threading.Lock()
+_current_job_id: Optional[int] = None
 
 
 def slugify(text: str) -> str:
@@ -79,11 +84,25 @@ def _run_transfer(job_id: int):
     - If job was 'uploading', skip download and go straight to upload from /data
     - If job was 'downloading', re-download (with file-level resume support)
     """
+    global _current_job_id
+
+    # Acquire lock to prevent concurrent downloads
+    if not _transfer_lock.acquire(timeout=5):
+        print(f"[Job {job_id}] Another job is already running (job {_current_job_id}), skipping")
+        sys.stdout.flush()
+        return
+
+    _current_job_id = job_id
+    print(f"[Job {job_id}] Acquired transfer lock")
+    sys.stdout.flush()
+
     conn = get_connection()
     job = conn.execute("SELECT * FROM transfer_jobs WHERE id = ?", (job_id,)).fetchone()
     conn.close()
 
     if not job:
+        _transfer_lock.release()
+        _current_job_id = None
         return
 
     job = dict(job)
@@ -210,6 +229,11 @@ def _run_transfer(job_id: int):
     except Exception as e:
         _update_job(job_id, status="failed", error_message=str(e))
         downloader.cleanup(job_id)
+    finally:
+        _current_job_id = None
+        _transfer_lock.release()
+        print(f"[Job {job_id}] Released transfer lock")
+        sys.stdout.flush()
 
 
 def _update_job(job_id: int, **kwargs):
