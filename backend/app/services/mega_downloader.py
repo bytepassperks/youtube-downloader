@@ -34,6 +34,9 @@ from app.database import get_connection
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "4"))  # chunks per large file
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB - files above this use parallel chunks
+# Max total memory for parallel chunks.  On a 2 GB plan, proxies + FastAPI
+# use ~500 MB, so we can safely use ~1.2 GB for parallel chunk buffers.
+_PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "1200")) * 1024 * 1024
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
 PSIPHON_BASE_SOCKS_PORT = 10800
 PSIPHON_BASE_HTTP_PORT = 10900
@@ -2062,8 +2065,16 @@ class MegaDownloader:
                 continue
 
             # Try parallel streaming for large files (first attempt only)
+            # Memory guard: each chunk is held fully in RAM before upload,
+            # so skip parallel if total chunk buffers would exceed budget.
             if use_parallel and attempts == 0 and file_info['size'] >= LARGE_FILE_THRESHOLD:
                 all_proxies = ip_rotator.get_all_proxies()
+                n_par = min(len(all_proxies), PARALLEL_CHUNKS)
+                per_chunk = file_info['size'] // max(n_par, 1)
+                if per_chunk * n_par > _PARALLEL_MAX_MEMORY:
+                    print(f"  Skipping parallel: {per_chunk*n_par/(1024*1024):.0f} MB > {_PARALLEL_MAX_MEMORY/(1024*1024):.0f} MB budget")
+                    sys.stdout.flush()
+                    all_proxies = []  # force single-stream
                 if len(all_proxies) >= 2:
                     print(f"  Stream-parallel ({len(all_proxies)} unique proxies) -> S3 via {proxy_label}...")
                     sys.stdout.flush()
