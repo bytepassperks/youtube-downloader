@@ -977,6 +977,7 @@ def _parallel_download_file(
 # Minimum S3 multipart part size (5 MB).  We buffer decrypted data in
 # memory until we have at least this much, then upload as a part.
 _MIN_PART_SIZE = 8 * 1024 * 1024  # 8 MB (above the 5 MB minimum)
+_S3_MIN_PART = 5 * 1024 * 1024   # S3 absolute minimum part size (5 MB)
 
 
 def _stream_download_and_upload(
@@ -1150,12 +1151,17 @@ def _stream_chunk_and_upload_parts(
 
             buf.extend(decrypted)
 
-            # Flush buffer as S3 part when large enough (8 MB)
-            if len(buf) >= _MIN_PART_SIZE:
-                etag = storage.upload_part(remote_key, upload_id, part_number, bytes(buf))
+            # Flush buffer as S3 part when large enough (8 MB).
+            # Keep a 5 MB reserve so the final flush is always >= S3 minimum.
+            # This prevents EntityTooSmall errors in parallel multipart uploads
+            # where each thread's last part must be >= 5 MB (except the very
+            # last part by PartNumber across all threads).
+            while len(buf) >= _MIN_PART_SIZE + _S3_MIN_PART:
+                part_data = bytes(buf[:_MIN_PART_SIZE])
+                etag = storage.upload_part(remote_key, upload_id, part_number, part_data)
                 parts.append({"PartNumber": part_number, "ETag": etag})
                 part_number += 1
-                buf.clear()
+                del buf[:_MIN_PART_SIZE]
 
             # Periodically check speed — abort if too slow
             now = time.time()
@@ -1171,15 +1177,10 @@ def _stream_chunk_and_upload_parts(
                 last_speed_check = now
                 last_speed_bytes = dl_bytes
 
-        # Upload remaining buffer as final part for this chunk
+        # Upload remaining buffer as final part for this chunk.
+        # The reserve strategy guarantees buf >= 5 MB here (unless the
+        # entire chunk was < 5 MB, which shouldn't happen for parallel).
         if buf:
-            # Trim if this is the very last chunk and extends past file_size
-            if end_byte >= file_size - 1 and start_byte + dl_bytes > file_size:
-                keep = file_size - start_byte - (dl_bytes - len(buf) - len(buf))  # approximate
-                # Simpler: just trim buf to expected remaining
-                remaining = expected_len - (dl_bytes - len(raw) if raw else dl_bytes)
-                if remaining > 0 and remaining < len(buf):
-                    buf = buf[:remaining]
             etag = storage.upload_part(remote_key, upload_id, part_number, bytes(buf))
             parts.append({"PartNumber": part_number, "ETag": etag})
             buf.clear()
