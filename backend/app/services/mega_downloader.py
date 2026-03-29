@@ -1134,28 +1134,38 @@ class IPRotator:
         return "unknown"
 
     def get_all_proxies(self) -> list:
-        """Get a list of all available proxy URLs for parallel downloads."""
-        proxies = []
-        # Add WARP instances
+        """Get a list of all available proxy URLs for parallel downloads.
+
+        Prioritises fast proxies (WARP, Psiphon) and only falls back to
+        slower ones (Tor, free pool) when there aren't enough fast proxies
+        to fill the chunk count.
+        """
+        fast = []
+        slow = []
+        # WARP — fastest (Cloudflare CDN, 50-200 Mbps)
         for w in self.warp_instances:
             url = w.get_proxy_url()
             if url:
-                proxies.append(url)
-        # Add Psiphon instances
+                fast.append(url)
+        # Psiphon — medium-fast (single hop, 5-15 Mbps)
         for p in self.psiphon_instances:
             url = p.get_proxy_url()
             if url:
-                proxies.append(url)
-        # Add Tor
+                fast.append(url)
+        # Tor — slow (3 hops, 1-5 Mbps), only as fallback
         if self.tor_manager and self.tor_manager.connected:
             url = self.tor_manager.get_proxy_url()
             if url:
-                proxies.append(url)
-        # Add current proxy if not already included
+                slow.append(url)
+        # Current proxy if not already included
         current = self.get_current_proxy()
-        if current and current not in proxies:
-            proxies.append(current)
-        return proxies if proxies else [None]  # [None] means direct connection
+        if current and current not in fast and current not in slow:
+            slow.append(current)
+        # Return fast proxies first; add slow only if we have < 4 fast
+        proxies = fast
+        if len(proxies) < 4:
+            proxies.extend(slow)
+        return proxies if proxies else [None]
 
     def rotate(self) -> bool:
         """Rotate to next IP. Priority: WARP > Psiphon > Tor > free pool > external > Render restart."""
@@ -1342,7 +1352,17 @@ class MegaDownloader:
         job_id: int,
         excluded_files: list = None,
         progress_callback=None,
+        file_done_callback=None,
     ) -> str:
+        """Download all files from a Mega folder.
+
+        Args:
+            file_done_callback: Optional callback called after each file is
+                downloaded successfully.  Signature:
+                    file_done_callback(local_path, relative_path, file_name, file_size)
+                The callback can upload + delete the file to free disk space
+                before the next file is downloaded.
+        """
         if excluded_files is None:
             excluded_files = []
 
@@ -1451,6 +1471,13 @@ class MegaDownloader:
                         download_speed=f"{avg_speed:.1f} MB/s",
                         current_file=f"Downloaded {downloaded}/{total_files} files ({avg_speed:.1f} MB/s avg)",
                     )
+                    # Upload + delete immediately to free disk space
+                    if file_done_callback:
+                        try:
+                            file_done_callback(dest_path, fpath, file_info['name'], fsize)
+                        except Exception as cb_err:
+                            print(f"[file_done_callback] Error: {cb_err}")
+                            sys.stdout.flush()
                 else:
                     failed_files.append(file_info)
                     print(f"  Failed to download after all IP rotations")
@@ -1474,6 +1501,15 @@ class MegaDownloader:
                     ):
                         downloaded += 1
                         downloaded_bytes += file_info['size']
+                        if file_done_callback:
+                            try:
+                                file_done_callback(
+                                    dest_path, file_info['path'],
+                                    file_info['name'], file_info['size'],
+                                )
+                            except Exception as cb_err:
+                                print(f"[file_done_callback] Error: {cb_err}")
+                                sys.stdout.flush()
                     else:
                         still_failed.append(file_info['name'])
                 if still_failed:

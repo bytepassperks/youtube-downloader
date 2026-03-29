@@ -116,33 +116,7 @@ def _run_transfer(job_id: int):
     download_path = os.path.join(downloader.download_base, str(job_id))
 
     try:
-        # Step 1: Download from Mega (skip if resuming from upload phase)
-        if previous_status == "uploading" and os.path.exists(download_path):
-            file_count = _count_files(download_path)
-            if file_count > 0:
-                print(f"[Resume] Job {job_id}: Skipping download, {file_count} files already on disk")
-            else:
-                print(f"[Resume] Job {job_id}: No files on disk despite uploading status, re-downloading")
-                _update_job(job_id, status="downloading", progress=10, error_message="")
-                download_path = downloader.download_folder(
-                    mega_link=job["mega_link"],
-                    job_id=job_id,
-                    excluded_files=excluded_files,
-                )
-        else:
-            _update_job(job_id, status="downloading", progress=10, error_message="")
-            download_path = downloader.download_folder(
-                mega_link=job["mega_link"],
-                job_id=job_id,
-                excluded_files=excluded_files,
-            )
-
-        # Step 2: Upload to storage using parallel threads
-        print(f"[Job {job_id}] Download complete. Starting upload phase...")
-        sys.stdout.flush()
-
-        _update_job(job_id, status="uploading", progress=40,
-                    current_file="Starting uploads...")
+        # Prepare storage for inline upload during download
         storage = get_storage(storage_target)
 
         # Check which files have already been uploaded (for resume support)
@@ -155,53 +129,79 @@ def _run_transfer(job_id: int):
         for row in rows:
             already_uploaded.add(row["file_path"])
 
-        # Collect all files to upload (skip already uploaded ones)
-        files_to_upload = []
-        for root, dirs, files in os.walk(download_path):
-            for fname in files:
-                if fname.startswith('.'):
-                    continue
-                local_file = os.path.join(root, fname)
-                relative = os.path.relpath(local_file, download_path)
-                if relative in already_uploaded:
-                    print(f"[Upload] Skipping already uploaded: {relative}")
-                    continue
-                remote_key = f"{slug}/{relative}"
-                files_to_upload.append((local_file, remote_key, fname, relative))
-
-        total = len(files_to_upload) + len(already_uploaded)
-        _update_job(job_id, total_files=total)
-
-        # Parallel upload using ThreadPoolExecutor
         uploaded = len(already_uploaded)
         uploaded_bytes = 0
         upload_start_time = time.time()
-        print(f"[Upload] {len(files_to_upload)} files to upload, {len(already_uploaded)} already done")
-        sys.stdout.flush()
-        with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
-            futures = {}
-            for local_file, remote_key, fname, relative in files_to_upload:
-                future = executor.submit(
-                    _upload_single_file,
-                    storage, local_file, remote_key, job_id, fname, relative, storage_target,
-                )
-                futures[future] = (fname, os.path.getsize(local_file) if os.path.exists(local_file) else 0)
 
-            for future in as_completed(futures):
-                fname, fsize = futures[future]
-                if future.result():
-                    uploaded += 1
-                    uploaded_bytes += fsize
-                    progress = 40 + int((uploaded / max(total, 1)) * 50)
-                    elapsed = time.time() - upload_start_time
-                    avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
-                    _update_job(
-                        job_id, uploaded_files=uploaded, progress=progress,
-                        current_file=f"Uploaded: {fname} ({uploaded}/{total})",
-                        upload_speed=f"{avg_speed:.1f} MB/s",
-                    )
+        def _on_file_done(local_path, relative_path, file_name, file_size):
+            """Called after each file downloads — upload to storage + delete local."""
+            nonlocal uploaded, uploaded_bytes
+            if relative_path in already_uploaded:
+                return
+            remote_key = f"{slug}/{relative_path}"
+            if _upload_single_file(
+                storage, local_path, remote_key, job_id,
+                file_name, relative_path, storage_target,
+            ):
+                uploaded += 1
+                uploaded_bytes += file_size
+                elapsed = time.time() - upload_start_time
+                avg_speed = (uploaded_bytes / (1024 * 1024)) / max(elapsed, 0.1)
+                _update_job(
+                    job_id, uploaded_files=uploaded,
+                    current_file=f"Uploaded: {file_name} ({uploaded} done)",
+                    upload_speed=f"{avg_speed:.1f} MB/s",
+                )
+
+        # Step 1: Download from Mega with inline upload per file
+        if previous_status == "uploading" and os.path.exists(download_path):
+            file_count = _count_files(download_path)
+            if file_count > 0:
+                print(f"[Resume] Job {job_id}: Skipping download, {file_count} files already on disk")
+                # Upload any remaining files on disk
+                for root, dirs, files in os.walk(download_path):
+                    for fname in files:
+                        if fname.startswith('.'):
+                            continue
+                        local_file = os.path.join(root, fname)
+                        relative = os.path.relpath(local_file, download_path)
+                        if relative in already_uploaded:
+                            continue
+                        _on_file_done(local_file, relative, fname, os.path.getsize(local_file))
+            else:
+                print(f"[Resume] Job {job_id}: No files on disk despite uploading status, re-downloading")
+                _update_job(job_id, status="downloading", progress=10, error_message="")
+                download_path = downloader.download_folder(
+                    mega_link=job["mega_link"],
+                    job_id=job_id,
+                    excluded_files=excluded_files,
+                    file_done_callback=_on_file_done,
+                )
+        else:
+            _update_job(job_id, status="downloading", progress=10, error_message="")
+            download_path = downloader.download_folder(
+                mega_link=job["mega_link"],
+                job_id=job_id,
+                excluded_files=excluded_files,
+                file_done_callback=_on_file_done,
+            )
+
+        # Step 2: Upload any files still on disk (fallback for callback failures)
+        print(f"[Job {job_id}] Download complete. Checking for remaining uploads...")
+        sys.stdout.flush()
+        if os.path.exists(download_path):
+            for root, dirs, files in os.walk(download_path):
+                for fname in files:
+                    if fname.startswith('.'):
+                        continue
+                    local_file = os.path.join(root, fname)
+                    relative = os.path.relpath(local_file, download_path)
+                    if relative in already_uploaded:
+                        continue
+                    _on_file_done(local_file, relative, fname, os.path.getsize(local_file))
 
         # Step 3: Mark complete
+        total = uploaded
         total_elapsed = time.time() - upload_start_time
         final_speed = (uploaded_bytes / (1024 * 1024)) / max(total_elapsed, 0.1)
         _update_job(
@@ -209,8 +209,9 @@ def _run_transfer(job_id: int):
             status="completed",
             progress=100,
             uploaded_files=uploaded,
+            total_files=total,
             completed_at=datetime.utcnow().isoformat(),
-            current_file=f"Complete: {uploaded}/{total} files uploaded",
+            current_file=f"Complete: {uploaded} files uploaded",
             upload_speed=f"{final_speed:.1f} MB/s",
         )
 
