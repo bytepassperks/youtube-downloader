@@ -12,6 +12,7 @@ import base64
 import time
 import sys
 import subprocess
+import select
 import requests
 from typing import Optional
 from Crypto.Cipher import AES
@@ -25,7 +26,9 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
 PSIPHON_BASE_SOCKS_PORT = 10800
 PSIPHON_BASE_HTTP_PORT = 10900
-PSIPHON_CONNECT_TIMEOUT = 20
+PSIPHON_CONNECT_TIMEOUT = 30
+RENDER_API_KEY = os.getenv("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
 
 
 # --- Mega Crypto Helpers ------------------------------------------------
@@ -303,27 +306,56 @@ class PsiphonManager:
         try:
             self.process = subprocess.Popen(
                 [PSIPHON_BINARY, "-config", self.config_path],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
         except Exception as e:
             print(f"[Psiphon-{self.instance_id}] Failed to start: {e}")
             return False
         start_time = time.time()
+        # Use non-blocking read with select to avoid blocking on readline()
+        import fcntl
+        fd = self.process.stdout.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        buffer = b""
         while time.time() - start_time < PSIPHON_CONNECT_TIMEOUT:
             if self.process.poll() is not None:
-                print(f"[Psiphon-{self.instance_id}] Process exited prematurely")
-                return False
-            line = self.process.stdout.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
-            if '"noticeType":"Tunnels"' in line and '"count":1' in line:
-                self.connected = True
-                elapsed = time.time() - start_time
-                print(f"[Psiphon-{self.instance_id}] Connected in {elapsed:.1f}s (SOCKS5: {self.socks_port})")
+                # Read remaining output for debugging
+                try:
+                    remaining = self.process.stdout.read()
+                    if remaining:
+                        buffer += remaining
+                except Exception:
+                    pass
+                print(f"[Psiphon-{self.instance_id}] Process exited (code {self.process.returncode})")
+                if buffer:
+                    print(f"[Psiphon-{self.instance_id}] Output: {buffer[:500]}")
                 sys.stdout.flush()
-                return True
+                return False
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if ready:
+                try:
+                    data = os.read(fd, 65536)
+                    if data:
+                        buffer += data
+                        text = buffer.decode('utf-8', errors='ignore')
+                        if '"noticeType":"Tunnels"' in text and '"count":1' in text:
+                            self.connected = True
+                            elapsed = time.time() - start_time
+                            print(f"[Psiphon-{self.instance_id}] Connected in {elapsed:.1f}s (SOCKS5: {self.socks_port})")
+                            sys.stdout.flush()
+                            return True
+                except OSError:
+                    pass
+        # Timeout - print what we got for debugging
+        if buffer:
+            text = buffer.decode('utf-8', errors='ignore')
+            # Print last few relevant lines
+            lines = [l for l in text.split('\n') if l.strip()][-5:]
+            for l in lines:
+                print(f"[Psiphon-{self.instance_id}] {l[:200]}")
         print(f"[Psiphon-{self.instance_id}] Connection timeout after {PSIPHON_CONNECT_TIMEOUT}s")
+        sys.stdout.flush()
         self.stop()
         return False
 
@@ -456,10 +488,17 @@ class IPRotator:
         if not self.direct_exhausted:
             self.current_mode = "direct"
             return True
-        # All exhausted - wait and reset Psiphon
-        print(f"[IPRotator] All IPs exhausted. Waiting 30s then resetting...")
+        # Try Render service restart for new IP as last resort
+        if RENDER_API_KEY and RENDER_SERVICE_ID:
+            print(f"[IPRotator] All IPs exhausted. Trying Render service restart for new IP...")
+            sys.stdout.flush()
+            if self._render_restart():
+                self._reset_psiphon()
+                return True
+        # All exhausted - wait and reset
+        print(f"[IPRotator] All IPs exhausted. Waiting 60s then resetting...")
         sys.stdout.flush()
-        time.sleep(30)
+        time.sleep(60)
         self._reset_psiphon()
         return True
 
@@ -472,6 +511,26 @@ class IPRotator:
         self.current_mode = "direct"
         print(f"[IPRotator] Reset complete")
         sys.stdout.flush()
+
+    def _render_restart(self) -> bool:
+        """Restart the Render service to get a new IP."""
+        try:
+            resp = requests.post(
+                f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/restart",
+                headers={"Authorization": f"Bearer {RENDER_API_KEY}"},
+                timeout=10,
+            )
+            if resp.status_code in (200, 202):
+                print(f"[IPRotator] Render restart triggered, waiting 60s...")
+                sys.stdout.flush()
+                time.sleep(60)
+                return True
+            else:
+                print(f"[IPRotator] Render restart failed: HTTP {resp.status_code}")
+                return False
+        except Exception as e:
+            print(f"[IPRotator] Render restart error: {e}")
+            return False
 
     def cleanup(self):
         for p in self.psiphon_instances:
