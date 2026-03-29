@@ -181,3 +181,28 @@ export async function getDownloadUrl(fileId: number) {
   }
   return res.json();
 }
+
+// Settings
+export async function getSettings() {
+  const res = await request("/api/settings/");
+  if (!res.ok) throw new Error("Failed to get settings");
+  return res.json();
+}
+
+export async function updateSettings(data: Record<string, string>) {
+  const res = await request("/api/settings/", {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Failed to update settings");
+  return res.json();
+}
+
+export async function reshareAllTelegram() {
+  const res = await request("/api/settings/reshare-telegram", { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || "Failed to reshare");
+  }
+  return res.json();
+}

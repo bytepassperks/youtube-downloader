@@ -94,6 +94,12 @@ def init_db():
             FOREIGN KEY (job_id) REFERENCES transfer_jobs(id),
             UNIQUE(user_id, job_id)
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
     """)
 
     conn.commit()

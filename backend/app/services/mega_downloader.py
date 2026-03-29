@@ -36,12 +36,11 @@ PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "4"))  # chunks per large fil
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB - files above this use parallel chunks
 # Max total memory for parallel chunks.  On a 2 GB plan, proxies + FastAPI
 # use ~500 MB, so we can safely use ~1.2 GB for parallel chunk buffers.
-# Parallel streaming is DISABLED on 2 GB plans.  Each chunk buffer holds
-# file_size/num_chunks in RAM; 3 threads of a 1 GB file = 1 GB + proxies +
-# FastAPI overhead → OOM.  Single-stream uses only ~16 MB constant memory
-# and still achieves 10-16 MB/s via WARP.  Set to 0 to disable, or raise
-# on plans with more RAM (e.g. 2000 for Pro 4 GB plan).
-_PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "0")) * 1024 * 1024
+# Parallel streaming now uses true streaming: each thread buffers only 8 MB
+# at a time (same as single-stream), so memory = 8 MB * num_threads = 32 MB
+# for 4 threads.  Safe on any plan.  This guard is kept as a safety net but
+# the default is high enough to never trigger on the Standard 2 GB plan.
+_PARALLEL_MAX_MEMORY = int(os.getenv("PARALLEL_MAX_MEMORY_MB", "1500")) * 1024 * 1024
 PSIPHON_BINARY = os.getenv("PSIPHON_BINARY", "/usr/local/bin/psiphon-tunnel-core")
 PSIPHON_BASE_SOCKS_PORT = 10800
 PSIPHON_BASE_HTTP_PORT = 10900
@@ -1082,19 +1081,24 @@ _MIN_CHUNK_SPEED = 500 * 1024   # 500 KB/s
 _CHUNK_SPEED_CHECK_INTERVAL = 30  # seconds
 
 
-def _stream_chunk_and_upload_part(
+def _stream_chunk_and_upload_parts(
     dl_url: str, file_key: tuple, node_key: tuple,
     file_size: int, start_byte: int, end_byte: int,
-    storage, remote_key: str, upload_id: str, part_number: int,
+    storage, remote_key: str, upload_id: str,
+    first_part_number: int,
     proxy: str = None, chunk_id: int = 0,
-) -> dict:
-    """Download a byte-range from Mega, decrypt, upload as one S3 part.
+) -> list:
+    """Download a byte-range from Mega, decrypt in 8 MB pieces, upload each
+    piece as a separate S3 multipart part.
 
-    Returns {"PartNumber": N, "ETag": "..."} on success, or None on failure.
-    Memory: holds only the decrypted chunk (~file_size/num_chunks).
+    Returns a list of {"PartNumber": N, "ETag": "..."} dicts on success,
+    or an empty list on failure.
+
+    Memory: holds only ~8 MB buffer at a time (same as single-stream).
     Disk: 0.
     Aborts if download speed drops below _MIN_CHUNK_SPEED for _CHUNK_SPEED_CHECK_INTERVAL.
     """
+    parts = []
     try:
         proxies = {'http': proxy, 'https': proxy} if proxy else None
         headers = {'Range': f'bytes={start_byte}-{end_byte}'}
@@ -1104,10 +1108,10 @@ def _stream_chunk_and_upload_part(
         )
         if resp.status_code == 509:
             print(f"[StreamChunk-{chunk_id}] 509 over quota")
-            return None
+            return []
         if resp.status_code not in (200, 206):
             print(f"[StreamChunk-{chunk_id}] HTTP {resp.status_code}")
-            return None
+            return []
 
         iv = _get_file_iv(node_key)
         initial_value = int.from_bytes(_a32_to_str(iv), 'big')
@@ -1123,46 +1127,71 @@ def _stream_chunk_and_upload_part(
         expected_len = end_byte - start_byte + 1
         buf = bytearray()
         dl_bytes = 0
+        part_number = first_part_number
         chunk_start = time.time()
         last_speed_check = chunk_start
         last_speed_bytes = 0
+
         for raw in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-            if raw:
-                buf.extend(cipher.decrypt(raw))
-                dl_bytes += len(raw)
-                # Periodically check speed — abort if too slow
-                now = time.time()
-                if now - last_speed_check >= _CHUNK_SPEED_CHECK_INTERVAL:
-                    interval_bytes = dl_bytes - last_speed_bytes
-                    interval_speed = interval_bytes / max(now - last_speed_check, 0.1)
-                    if interval_speed < _MIN_CHUNK_SPEED:
-                        speed_kbps = interval_speed / 1024
-                        print(f"[StreamChunk-{chunk_id}] Too slow ({speed_kbps:.0f} KB/s < 500 KB/s), aborting")
-                        sys.stdout.flush()
-                        resp.close()
-                        return None
-                    last_speed_check = now
-                    last_speed_bytes = dl_bytes
+            if not raw:
+                continue
+            decrypted = cipher.decrypt(raw)
+            dl_bytes += len(raw)
 
-        # Trim to expected length (Mega pads to AES block boundary on last chunk)
-        if len(buf) > expected_len:
-            buf = buf[:expected_len]
-        # Also trim if this is the very last chunk and extends past file_size
-        if end_byte >= file_size - 1 and start_byte + len(buf) > file_size:
-            buf = buf[:file_size - start_byte]
+            # Trim if we've passed file_size (Mega pads to AES block boundary)
+            total_so_far = dl_bytes
+            if total_so_far > expected_len:
+                overflow = total_so_far - expected_len
+                if overflow > 0 and overflow < len(decrypted):
+                    decrypted = decrypted[:len(decrypted) - overflow]
+                elif overflow >= len(decrypted):
+                    break
 
-        chunk_mb = len(buf) / (1024 * 1024)
-        print(f"[StreamChunk-{chunk_id}] Downloaded {chunk_mb:.1f} MB, uploading part {part_number}...")
+            buf.extend(decrypted)
+
+            # Flush buffer as S3 part when large enough (8 MB)
+            if len(buf) >= _MIN_PART_SIZE:
+                etag = storage.upload_part(remote_key, upload_id, part_number, bytes(buf))
+                parts.append({"PartNumber": part_number, "ETag": etag})
+                part_number += 1
+                buf.clear()
+
+            # Periodically check speed — abort if too slow
+            now = time.time()
+            if now - last_speed_check >= _CHUNK_SPEED_CHECK_INTERVAL:
+                interval_bytes = dl_bytes - last_speed_bytes
+                interval_speed = interval_bytes / max(now - last_speed_check, 0.1)
+                if interval_speed < _MIN_CHUNK_SPEED:
+                    speed_kbps = interval_speed / 1024
+                    print(f"[StreamChunk-{chunk_id}] Too slow ({speed_kbps:.0f} KB/s < 500 KB/s), aborting")
+                    sys.stdout.flush()
+                    resp.close()
+                    return []
+                last_speed_check = now
+                last_speed_bytes = dl_bytes
+
+        # Upload remaining buffer as final part for this chunk
+        if buf:
+            # Trim if this is the very last chunk and extends past file_size
+            if end_byte >= file_size - 1 and start_byte + dl_bytes > file_size:
+                keep = file_size - start_byte - (dl_bytes - len(buf) - len(buf))  # approximate
+                # Simpler: just trim buf to expected remaining
+                remaining = expected_len - (dl_bytes - len(raw) if raw else dl_bytes)
+                if remaining > 0 and remaining < len(buf):
+                    buf = buf[:remaining]
+            etag = storage.upload_part(remote_key, upload_id, part_number, bytes(buf))
+            parts.append({"PartNumber": part_number, "ETag": etag})
+            buf.clear()
+
+        elapsed = time.time() - chunk_start
+        speed = (dl_bytes / (1024 * 1024)) / max(elapsed, 0.1)
+        print(f"[StreamChunk-{chunk_id}] Done: {dl_bytes/(1024*1024):.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s), {len(parts)} parts")
         sys.stdout.flush()
-
-        etag = storage.upload_part(remote_key, upload_id, part_number, bytes(buf))
-        print(f"[StreamChunk-{chunk_id}] Part {part_number} uploaded ({chunk_mb:.1f} MB)")
-        sys.stdout.flush()
-        return {"PartNumber": part_number, "ETag": etag}
+        return parts
     except Exception as e:
         print(f"[StreamChunk-{chunk_id}] Error: {e}")
         sys.stdout.flush()
-        return None
+        return []
 
 
 def _stream_parallel_download_upload(
@@ -1170,11 +1199,11 @@ def _stream_parallel_download_upload(
     file_size: int, proxies: list, storage, remote_key: str,
     speed_callback=None,
 ) -> bool:
-    """Parallel chunk download from Mega → decrypt → upload parts to S3.
+    """Parallel chunk download from Mega -> decrypt -> upload parts to S3.
 
-    Each chunk downloads through a different proxy, decrypts in memory,
-    and uploads as an S3 multipart part.  Zero disk usage.
-    Memory: ~chunk_size per thread (file_size / num_chunks).
+    Each thread downloads its byte-range, decrypts in 8 MB streaming pieces,
+    and uploads each piece as a separate S3 multipart part.  Zero disk usage.
+    Memory: ~8 MB per thread = ~32 MB for 4 threads.  Works for ANY file size.
     """
     num_chunks = min(len(proxies), PARALLEL_CHUNKS)
     if num_chunks < 2:
@@ -1189,7 +1218,14 @@ def _stream_parallel_download_upload(
         upload_id = storage.create_multipart_upload(remote_key)
         chunk_size = file_size // num_chunks
 
-        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} chunks -> S3")
+        # Pre-calculate part number ranges for each thread so they don't collide.
+        # Each thread's chunk produces ceil(chunk_bytes / 8MB) parts.
+        parts_per_chunk = (chunk_size + _MIN_PART_SIZE - 1) // _MIN_PART_SIZE + 1  # +1 safety
+        # Last chunk may be larger, give it extra room
+        last_chunk_size = file_size - (num_chunks - 1) * chunk_size
+        parts_last_chunk = (last_chunk_size + _MIN_PART_SIZE - 1) // _MIN_PART_SIZE + 1
+
+        print(f"[StreamParallel] {file_size/(1024*1024):.1f} MB in {num_chunks} threads (~8 MB/part) -> S3")
         sys.stdout.flush()
         start_time = time.time()
 
@@ -1200,12 +1236,14 @@ def _stream_parallel_download_upload(
                 start_byte = i * chunk_size
                 end_byte = file_size - 1 if i == num_chunks - 1 else (i + 1) * chunk_size - 1
                 proxy = proxies[i % len(proxies)]
+                # Assign non-overlapping part number ranges
+                first_part = i * parts_per_chunk + 1
                 future = executor.submit(
-                    _stream_chunk_and_upload_part,
+                    _stream_chunk_and_upload_parts,
                     dl_url, file_key, node_key, file_size,
                     start_byte, end_byte,
                     storage, remote_key, upload_id,
-                    i + 1,  # part_number (1-based)
+                    first_part,
                     proxy, i,
                 )
                 futures[future] = i
@@ -1216,21 +1254,26 @@ def _stream_parallel_download_upload(
                     results[idx] = future.result()
                 except Exception as e:
                     print(f"[StreamParallel] Chunk {idx} exception: {e}")
-                    results[idx] = None
+                    results[idx] = []
 
         elapsed = time.time() - start_time
         speed = (file_size / (1024 * 1024)) / max(elapsed, 0.1)
 
-        if all(r is not None for r in results):
-            parts = sorted(results, key=lambda p: p["PartNumber"])
-            storage.complete_multipart_upload(remote_key, upload_id, parts)
-            print(f"[StreamParallel] Complete: {file_size/(1024*1024):.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s)")
+        # Check all threads succeeded (returned non-empty part lists)
+        if all(r for r in results):
+            # Merge all parts from all threads and sort by PartNumber
+            all_parts = []
+            for part_list in results:
+                all_parts.extend(part_list)
+            all_parts.sort(key=lambda p: p["PartNumber"])
+            storage.complete_multipart_upload(remote_key, upload_id, all_parts)
+            print(f"[StreamParallel] Complete: {file_size/(1024*1024):.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s), {len(all_parts)} parts")
             sys.stdout.flush()
             if speed_callback:
                 speed_callback(file_size, file_size, speed)
             return True
         else:
-            failed = [i for i, r in enumerate(results) if r is None]
+            failed = [i for i, r in enumerate(results) if not r]
             print(f"[StreamParallel] Failed chunks: {failed}")
             sys.stdout.flush()
             storage.abort_multipart_upload(remote_key, upload_id)
@@ -2070,16 +2113,10 @@ class MegaDownloader:
                 continue
 
             # Try parallel streaming for large files (first attempt only)
-            # Memory guard: each chunk is held fully in RAM before upload,
-            # so skip parallel if total chunk buffers would exceed budget.
+            # Now uses true streaming (8 MB/part per thread), so memory is
+            # only ~8 MB * num_threads regardless of file size.
             if use_parallel and attempts == 0 and file_info['size'] >= LARGE_FILE_THRESHOLD:
                 all_proxies = ip_rotator.get_all_proxies()
-                n_par = min(len(all_proxies), PARALLEL_CHUNKS)
-                per_chunk = file_info['size'] // max(n_par, 1)
-                if per_chunk * n_par > _PARALLEL_MAX_MEMORY:
-                    print(f"  Skipping parallel: {per_chunk*n_par/(1024*1024):.0f} MB > {_PARALLEL_MAX_MEMORY/(1024*1024):.0f} MB budget")
-                    sys.stdout.flush()
-                    all_proxies = []  # force single-stream
                 if len(all_proxies) >= 2:
                     print(f"  Stream-parallel ({len(all_proxies)} unique proxies) -> S3 via {proxy_label}...")
                     sys.stdout.flush()

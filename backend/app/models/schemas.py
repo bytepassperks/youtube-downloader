@@ -100,3 +100,36 @@ class SignedUrlResponse(BaseModel):
     url: str
     expires_in: int
     file_name: str
+
+
+# Settings
+class SettingsUpdate(BaseModel):
+    telegram_bot_token: Optional[str] = None
+    telegram_group_chat_id: Optional[str] = None
+    idrive_access_key: Optional[str] = None
+    idrive_secret_key: Optional[str] = None
+    idrive_endpoint: Optional[str] = None
+    idrive_bucket: Optional[str] = None
+    idrive_region: Optional[str] = None
+    b2_key_id: Optional[str] = None
+    b2_app_key: Optional[str] = None
+    b2_bucket_name: Optional[str] = None
+    portal_base_url: Optional[str] = None
+    admin_email: Optional[str] = None
+    admin_password: Optional[str] = None
+
+
+class SettingsResponse(BaseModel):
+    telegram_bot_token: str = ""
+    telegram_group_chat_id: str = ""
+    idrive_access_key: str = ""
+    idrive_secret_key: str = ""
+    idrive_endpoint: str = ""
+    idrive_bucket: str = ""
+    idrive_region: str = ""
+    b2_key_id: str = ""
+    b2_app_key: str = ""
+    b2_bucket_name: str = ""
+    portal_base_url: str = ""
+    admin_email: str = ""
+    admin_password: str = ""

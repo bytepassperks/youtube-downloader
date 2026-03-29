@@ -6,7 +6,8 @@ import DashboardPage from "./pages/DashboardPage";
 import NewJobPage from "./pages/NewJobPage";
 import MembersPage from "./pages/MembersPage";
 import ContentPage from "./pages/ContentPage";
-import { LayoutDashboard, FolderOpen, LogOut, Loader2 } from "lucide-react";
+import SettingsPage from "./pages/SettingsPage";
+import { LayoutDashboard, FolderOpen, Settings, LogOut, Loader2 } from "lucide-react";
 
 interface User {
   id: number;
@@ -21,6 +22,7 @@ function Layout({ user, children }: { user: User; children: React.ReactNode }) {
     ? [
         { path: "/", label: "Dashboard", icon: LayoutDashboard },
         { path: "/content", label: "Content", icon: FolderOpen },
+        { path: "/settings", label: "Settings", icon: Settings },
       ]
     : [{ path: "/content", label: "My Content", icon: FolderOpen }];
 
@@ -121,6 +123,7 @@ function App() {
           <Route path="/members" element={<MembersPage />} />
           <Route path="/content/:slug" element={<ContentPage />} />
           <Route path="/content" element={<ContentPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Layout>

@@ -5,8 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db, get_connection
 from app.utils.auth import get_password_hash
-from app.config import settings
+from app.config import settings as app_settings
 from app.routes import auth, jobs, members, portal
+from app.routes import settings as settings_route
 
 app = FastAPI(title="MegaTransfer API")
 
@@ -24,6 +25,7 @@ app.include_router(auth.router)
 app.include_router(jobs.router)
 app.include_router(members.router)
 app.include_router(portal.router)
+app.include_router(settings_route.router)
 
 
 @app.on_event("startup")
@@ -35,18 +37,18 @@ async def startup():
     init_db()
     # Create or update default admin
     conn = get_connection()
-    admin = conn.execute("SELECT id FROM users WHERE email = ?", (settings.ADMIN_EMAIL,)).fetchone()
-    hashed = get_password_hash(settings.ADMIN_PASSWORD)
+    admin = conn.execute("SELECT id FROM users WHERE email = ?", (app_settings.ADMIN_EMAIL,)).fetchone()
+    hashed = get_password_hash(app_settings.ADMIN_PASSWORD)
     if not admin:
         conn.execute(
             "INSERT INTO users (email, hashed_password, is_admin) VALUES (?, ?, 1)",
-            (settings.ADMIN_EMAIL, hashed),
+            (app_settings.ADMIN_EMAIL, hashed),
         )
     else:
         # Always update admin password to match env var
         conn.execute(
             "UPDATE users SET hashed_password = ? WHERE email = ?",
-            (hashed, settings.ADMIN_EMAIL),
+            (hashed, app_settings.ADMIN_EMAIL),
         )
     conn.commit()
 
