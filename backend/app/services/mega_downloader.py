@@ -1068,6 +1068,12 @@ def _stream_download_and_upload(
         return False
 
 
+# Minimum acceptable speed (bytes/sec) for a parallel chunk.
+# If a chunk averages below this for 30s it will be aborted.
+_MIN_CHUNK_SPEED = 500 * 1024   # 500 KB/s
+_CHUNK_SPEED_CHECK_INTERVAL = 30  # seconds
+
+
 def _stream_chunk_and_upload_part(
     dl_url: str, file_key: tuple, node_key: tuple,
     file_size: int, start_byte: int, end_byte: int,
@@ -1079,13 +1085,14 @@ def _stream_chunk_and_upload_part(
     Returns {"PartNumber": N, "ETag": "..."} on success, or None on failure.
     Memory: holds only the decrypted chunk (~file_size/num_chunks).
     Disk: 0.
+    Aborts if download speed drops below _MIN_CHUNK_SPEED for _CHUNK_SPEED_CHECK_INTERVAL.
     """
     try:
         proxies = {'http': proxy, 'https': proxy} if proxy else None
         headers = {'Range': f'bytes={start_byte}-{end_byte}'}
         resp = requests.get(
             dl_url, stream=True, proxies=proxies,
-            headers=headers, timeout=(30, 3600),
+            headers=headers, timeout=(30, 600),
         )
         if resp.status_code == 509:
             print(f"[StreamChunk-{chunk_id}] 509 over quota")
@@ -1107,9 +1114,27 @@ def _stream_chunk_and_upload_part(
 
         expected_len = end_byte - start_byte + 1
         buf = bytearray()
+        dl_bytes = 0
+        chunk_start = time.time()
+        last_speed_check = chunk_start
+        last_speed_bytes = 0
         for raw in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
             if raw:
                 buf.extend(cipher.decrypt(raw))
+                dl_bytes += len(raw)
+                # Periodically check speed — abort if too slow
+                now = time.time()
+                if now - last_speed_check >= _CHUNK_SPEED_CHECK_INTERVAL:
+                    interval_bytes = dl_bytes - last_speed_bytes
+                    interval_speed = interval_bytes / max(now - last_speed_check, 0.1)
+                    if interval_speed < _MIN_CHUNK_SPEED:
+                        speed_kbps = interval_speed / 1024
+                        print(f"[StreamChunk-{chunk_id}] Too slow ({speed_kbps:.0f} KB/s < 500 KB/s), aborting")
+                        sys.stdout.flush()
+                        resp.close()
+                        return None
+                    last_speed_check = now
+                    last_speed_bytes = dl_bytes
 
         # Trim to expected length (Mega pads to AES block boundary on last chunk)
         if len(buf) > expected_len:
@@ -1382,12 +1407,13 @@ class IPRotator:
     def get_all_proxies(self) -> list:
         """Get a list of all available proxy URLs for parallel downloads.
 
-        Prioritises fast proxies (WARP, Psiphon) and only falls back to
-        slower ones (Tor, free pool) when there aren't enough fast proxies
-        to fill the chunk count.
+        ONLY returns fast proxies (WARP, Psiphon).  Slow proxies (Tor,
+        free pool) are deliberately excluded so they never bottleneck a
+        parallel chunk download.  If we have fewer fast proxies than
+        PARALLEL_CHUNKS, we reuse WARP proxies (each gets a separate
+        Mega connection anyway).
         """
         fast = []
-        slow = []
         # WARP — fastest (Cloudflare CDN, 50-200 Mbps)
         for w in self.warp_instances:
             url = w.get_proxy_url()
@@ -1398,20 +1424,14 @@ class IPRotator:
             url = p.get_proxy_url()
             if url:
                 fast.append(url)
-        # Tor — slow (3 hops, 1-5 Mbps), only as fallback
-        if self.tor_manager and self.tor_manager.connected:
-            url = self.tor_manager.get_proxy_url()
-            if url:
-                slow.append(url)
-        # Current proxy if not already included
-        current = self.get_current_proxy()
-        if current and current not in fast and current not in slow:
-            slow.append(current)
-        # Return fast proxies first; add slow only if we have < 4 fast
-        proxies = fast
-        if len(proxies) < 4:
-            proxies.extend(slow)
-        return proxies if proxies else [None]
+        # If we have fast proxies but fewer than PARALLEL_CHUNKS,
+        # duplicate WARP proxies to fill the slots (each gets a separate
+        # HTTP connection so they still download in parallel)
+        if fast and len(fast) < PARALLEL_CHUNKS:
+            base = list(fast)
+            while len(fast) < PARALLEL_CHUNKS:
+                fast.append(base[len(fast) % len(base)])
+        return fast if fast else [None]
 
     def rotate(self) -> bool:
         """Rotate to next IP. Priority: WARP > Psiphon > Tor > free pool > external > Render restart."""
