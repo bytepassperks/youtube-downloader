@@ -43,7 +43,18 @@ async def startup():
             (hashed, settings.ADMIN_EMAIL),
         )
     conn.commit()
+
+    # Resume incomplete transfer jobs (e.g., after Render restart for IP rotation)
+    from app.services.transfer_worker import process_transfer_job
+    incomplete = conn.execute(
+        "SELECT id FROM transfer_jobs WHERE status IN ('downloading', 'uploading', 'queued')"
+    ).fetchall()
     conn.close()
+
+    for row in incomplete:
+        job_id = row["id"]
+        print(f"[Startup] Resuming incomplete job {job_id}")
+        process_transfer_job(job_id)
 
 
 @app.get("/healthz")
