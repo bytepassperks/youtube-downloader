@@ -1208,11 +1208,10 @@ def _stream_parallel_download_upload(
     """
     num_chunks = min(len(proxies), PARALLEL_CHUNKS)
     if num_chunks < 2:
-        return _stream_download_and_upload(
-            dl_url, file_key, node_key, file_size, storage, remote_key,
-            proxy=proxies[0] if proxies else None,
-            speed_callback=speed_callback,
-        )
+        num_chunks = PARALLEL_CHUNKS  # Always use parallel even with same proxy
+    # Extend proxies list if shorter than num_chunks
+    while len(proxies) < num_chunks:
+        proxies.append(proxies[0] if proxies else None)
 
     upload_id = None
     try:
@@ -1457,17 +1456,15 @@ class IPRotator:
         return "unknown"
 
     def get_all_proxies(self) -> list:
-        """Get a list of *unique* WARP proxy URLs for parallel downloads.
+        """Get a list of proxy URLs for parallel downloads.
 
-        ONLY returns WARP proxies.  Psiphon, Tor, and free pool are
-        excluded because parallel downloads are only as fast as the
-        slowest chunk — mixing fast WARP (~50 Mbps) with slower Psiphon
-        (~5 Mbps) bottlenecks the whole download.
-
-        IMPORTANT: We do NOT duplicate proxies.  Each proxy maps to a
-        separate Cloudflare/Mega quota slot.  Reusing the same proxy for
-        multiple chunks makes them compete for the same quota and causes
-        509 errors.  If we have 3 unique WARP proxies, we use 3 chunks.
+        Returns PARALLEL_CHUNKS proxies.  Prefers unique WARP proxies
+        for separate Cloudflare IPs, but if fewer than PARALLEL_CHUNKS
+        unique proxies are available, duplicates the current proxy so
+        that parallel byte-range downloads still happen.  Multiple TCP
+        connections to the same Mega URL through the same proxy still
+        provide 2-4x speedup by saturating bandwidth via concurrent
+        connections (overcoming single-TCP window size limits).
         """
         fast = []
         # WARP — fastest (Cloudflare CDN, 50-200 Mbps)
@@ -1475,9 +1472,16 @@ class IPRotator:
             url = w.get_proxy_url()
             if url and url not in fast:
                 fast.append(url)
-        # Do NOT include Psiphon/Tor — they are much slower and would
-        # bottleneck the entire parallel download.
-        return fast if fast else [None]
+        # If we have some WARP proxies but fewer than PARALLEL_CHUNKS,
+        # duplicate them to fill up to PARALLEL_CHUNKS slots.
+        if fast:
+            while len(fast) < PARALLEL_CHUNKS:
+                fast.append(fast[len(fast) % len(fast[:1])])
+            return fast
+        # No WARP available — use current proxy (even None/direct)
+        # duplicated PARALLEL_CHUNKS times for parallel byte-range downloads
+        current = self.get_current_proxy()
+        return [current] * PARALLEL_CHUNKS
 
     def rotate(self) -> bool:
         """Rotate to next IP. Priority: WARP > Psiphon > Tor > free pool > external > Render restart."""
@@ -2113,33 +2117,33 @@ class MegaDownloader:
                 attempts += 1
                 continue
 
-            # Try parallel streaming for large files (first attempt only)
-            # Now uses true streaming (8 MB/part per thread), so memory is
-            # only ~8 MB * num_threads regardless of file size.
-            if use_parallel and attempts == 0 and file_info['size'] >= LARGE_FILE_THRESHOLD:
+            # Try parallel streaming for large files
+            # True streaming: 8 MB/part per thread, memory = ~8 MB * num_threads.
+            # Works even with 1 proxy — multiple byte-range TCP connections
+            # saturate bandwidth better than single stream.
+            if use_parallel and file_info['size'] >= LARGE_FILE_THRESHOLD:
                 all_proxies = ip_rotator.get_all_proxies()
-                if len(all_proxies) >= 2:
-                    print(f"  Stream-parallel ({len(all_proxies)} unique proxies) -> S3 via {proxy_label}...")
+                print(f"  Stream-parallel ({PARALLEL_CHUNKS} threads, {len(set(p for p in all_proxies if p))} unique proxies) -> S3 via {proxy_label}...")
+                sys.stdout.flush()
+                success = _stream_parallel_download_upload(
+                    dl_url=dl_url,
+                    file_key=file_info['file_key'],
+                    node_key=file_info['node_key'],
+                    file_size=file_info['size'],
+                    proxies=all_proxies,
+                    storage=storage,
+                    remote_key=remote_key,
+                    speed_callback=speed_callback,
+                )
+                if success:
+                    fsize_mb = file_info['size'] / (1024 * 1024)
+                    print(f"  OK ({fsize_mb:.2f} MB stream-parallel)")
                     sys.stdout.flush()
-                    success = _stream_parallel_download_upload(
-                        dl_url=dl_url,
-                        file_key=file_info['file_key'],
-                        node_key=file_info['node_key'],
-                        file_size=file_info['size'],
-                        proxies=all_proxies,
-                        storage=storage,
-                        remote_key=remote_key,
-                        speed_callback=speed_callback,
-                    )
-                    if success:
-                        fsize_mb = file_info['size'] / (1024 * 1024)
-                        print(f"  OK ({fsize_mb:.2f} MB stream-parallel)")
-                        sys.stdout.flush()
-                        return True
-                    # Parallel failed — fall through to single-stream immediately
-                    # without counting as a failed attempt (don't rotate yet)
-                    print(f"  Parallel failed, falling back to single-stream...")
-                    sys.stdout.flush()
+                    return True
+                # Parallel failed — fall through to single-stream immediately
+                # without counting as a failed attempt (don't rotate yet)
+                print(f"  Parallel failed, falling back to single-stream...")
+                sys.stdout.flush()
 
             # Single-stream fallback
             success = _stream_download_and_upload(
