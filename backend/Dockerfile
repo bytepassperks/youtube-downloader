@@ -1,0 +1,34 @@
+FROM python:3.12-slim
+
+# Install megatools and system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends megatools curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Verify megadl is available
+RUN megadl --version || true
+
+WORKDIR /app
+
+# Install poetry
+RUN pip install --no-cache-dir poetry
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock* ./
+
+# Install dependencies (no virtualenv in Docker)
+RUN poetry config virtualenvs.create false && \
+    poetry install --no-interaction --no-ansi --no-root
+
+# Copy application code
+COPY . .
+
+# Create data directory for SQLite
+RUN mkdir -p /data
+
+# Expose port
+EXPOSE 10000
+
+# Start the app (Render uses port 10000 by default)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000"]
