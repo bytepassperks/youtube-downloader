@@ -1,9 +1,17 @@
 import os
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config as BotoConfig
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
 from app.config import settings
+
+# Multipart upload config for faster large file uploads
+MULTIPART_CONFIG = TransferConfig(
+    multipart_threshold=8 * 1024 * 1024,  # 8MB threshold
+    max_concurrency=10,  # 10 parallel parts
+    multipart_chunksize=8 * 1024 * 1024,  # 8MB chunks
+)
 
 
 class IDriveStorage:
@@ -21,7 +29,10 @@ class IDriveStorage:
         self.bucket = settings.IDRIVE_BUCKET
 
     def upload_file(self, local_path: str, remote_key: str) -> str:
-        self.client.upload_file(local_path, self.bucket, remote_key)
+        self.client.upload_file(
+            local_path, self.bucket, remote_key,
+            Config=MULTIPART_CONFIG,
+        )
         return remote_key
 
     def generate_signed_url(self, remote_key: str, expiry: int = None) -> str:
