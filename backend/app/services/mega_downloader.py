@@ -79,7 +79,10 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
     """Download from Mega with retry logic and optional proxy.
 
     Returns True on success, False if throttled/failed after retries.
+    Uses Popen to stream megadl output live to logs for visibility.
     """
+    import sys
+
     for attempt in range(max_retries):
         try:
             cmd = ["megadl", mega_link, "--path", download_path]
@@ -87,21 +90,50 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
                 cmd.extend(["--proxy", proxy])
 
             print(f"[Download] Attempt {attempt + 1}/{max_retries}, proxy={proxy or 'direct'}")
+            print(f"[Download] Command: {' '.join(cmd[:3])}... --path {download_path}")
+            sys.stdout.flush()
 
-            result = subprocess.run(
+            # Use Popen to stream output live instead of capturing silently
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=timeout,
             )
 
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
-            output = stdout + stderr
+            output_lines = []
+            start_time = time.time()
+            last_log_time = start_time
+
+            # Read output line by line, streaming to stdout
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    output_lines.append(line)
+                    # Log every line but also periodic progress
+                    now = time.time()
+                    if now - last_log_time >= 30 or len(output_lines) <= 5:
+                        print(f"[megadl] {line}")
+                        sys.stdout.flush()
+                        last_log_time = now
+
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    proc.kill()
+                    print(f"[Download] Timeout after {timeout}s")
+                    sys.stdout.flush()
+                    break
+
+            proc.wait(timeout=60)
+            output = "\n".join(output_lines)
+            elapsed = int(time.time() - start_time)
+            print(f"[Download] Process exited with code {proc.returncode} after {elapsed}s, {len(output_lines)} lines output")
+            sys.stdout.flush()
 
             # Check for success
-            if result.returncode == 0:
+            if proc.returncode == 0:
                 print(f"[Download] Success with proxy={proxy or 'direct'}")
+                sys.stdout.flush()
                 return True
 
             # Check for quota/bandwidth limit errors
@@ -117,21 +149,32 @@ def _download_with_retry(mega_link: str, download_path: str, proxy: str = None,
 
             if is_throttled:
                 print(f"[Download] Throttled on attempt {attempt + 1}, proxy={proxy or 'direct'}")
+                sys.stdout.flush()
                 if attempt < max_retries - 1:
                     wait_time = 10 * (attempt + 1)
                     print(f"[Download] Waiting {wait_time}s before retry...")
+                    sys.stdout.flush()
                     time.sleep(wait_time)
                 continue
 
-            # Non-throttle error
-            print(f"[Download] Error: {output[:500]}")
+            # Non-throttle error - print last few lines for debugging
+            last_output = "\n".join(output_lines[-10:]) if output_lines else "(no output)"
+            print(f"[Download] Error (last 10 lines): {last_output}")
+            sys.stdout.flush()
             if attempt < max_retries - 1:
                 time.sleep(5)
                 continue
 
         except subprocess.TimeoutExpired:
             print(f"[Download] Timeout on attempt {attempt + 1}")
+            sys.stdout.flush()
             if attempt < max_retries - 1:
+                continue
+        except Exception as e:
+            print(f"[Download] Unexpected error: {e}")
+            sys.stdout.flush()
+            if attempt < max_retries - 1:
+                time.sleep(5)
                 continue
 
     return False
