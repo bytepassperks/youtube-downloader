@@ -460,21 +460,30 @@ class TorManager:
     def _kill_existing_tor(self):
         """Kill any existing Tor processes to free ports."""
         try:
-            result = subprocess.run(
-                ["pkill", "-f", "tor -f /tmp/torrc"],
+            subprocess.run(
+                ["pkill", "-9", "-f", "tor"],
                 capture_output=True, timeout=5,
             )
-            if result.returncode == 0:
-                print("[Tor] Killed existing Tor process")
-                time.sleep(1)  # Wait for port release
         except Exception:
             pass
-        # Also try killall as fallback
         try:
-            subprocess.run(["killall", "tor"], capture_output=True, timeout=5)
-            time.sleep(1)
+            subprocess.run(["killall", "-9", "tor"], capture_output=True, timeout=5)
         except Exception:
             pass
+        # Wait for ports to be released
+        time.sleep(2)
+        # Force free the ports if still bound
+        import socket
+        for port in [self.socks_port, self.control_port]:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(('127.0.0.1', port))
+                s.close()
+                print(f"[Tor] Port {port} still in use after kill, waiting...")
+                time.sleep(3)
+            except (ConnectionRefusedError, OSError):
+                pass  # Port is free
 
     def start(self) -> bool:
         """Start Tor daemon. Returns True when ready."""
@@ -1014,46 +1023,47 @@ class IPRotator:
         sys.stdout.flush()
         started = 0
 
-        # 1. Try WARP first (fastest — Cloudflare CDN, 50-200 Mbps)
+        # 1. Start 3 WARP instances (each = separate Cloudflare registration = separate IP)
+        # This enables parallel chunk downloads through different IPs
         if self.warp_available:
-            try:
-                warp = WARPManager(instance_id=0)
-                if warp.start():
-                    self.warp_instances.append(warp)
-                    started += 1
-                    self.current_mode = "warp"
-                    self.current_warp_idx = 0
-                    print(f"[IPRotator] WARP-0 ready (port {warp.socks_port})")
-                else:
-                    self.warp_failed = True
-                    print(f"[IPRotator] WARP not available on this host")
-            except Exception as e:
-                self.warp_failed = True
-                print(f"[IPRotator] WARP error: {e}")
-            sys.stdout.flush()
-
-        # 2. Start 2 Psiphon instances for parallel channels (~80MB each)
-        if self.psiphon_available:
-            for i in range(2):
+            for i in range(3):
                 try:
-                    psiphon = PsiphonManager(instance_id=i)
-                    if psiphon.start():
-                        self.psiphon_instances.append(psiphon)
+                    warp = WARPManager(instance_id=i)
+                    if warp.start():
+                        self.warp_instances.append(warp)
                         started += 1
-                        print(f"[IPRotator] Psiphon-{i} ready (port {psiphon.socks_port})")
-                        if self.current_mode == "direct":
-                            self.current_mode = "psiphon"
-                    else:
-                        print(f"[IPRotator] Psiphon-{i} failed")
                         if i == 0:
-                            self.psiphon_failed = True
+                            self.current_mode = "warp"
+                            self.current_warp_idx = 0
+                    else:
+                        if i == 0:
+                            self.warp_failed = True
+                        print(f"[IPRotator] WARP-{i} not available")
                         break
                 except Exception as e:
-                    print(f"[IPRotator] Psiphon-{i} error: {e}")
                     if i == 0:
-                        self.psiphon_failed = True
+                        self.warp_failed = True
+                    print(f"[IPRotator] WARP-{i} error: {e}")
                     break
                 sys.stdout.flush()
+
+        # 2. Start 1 Psiphon instance as backup (~80MB)
+        if self.psiphon_available:
+            try:
+                psiphon = PsiphonManager(instance_id=0)
+                if psiphon.start():
+                    self.psiphon_instances.append(psiphon)
+                    started += 1
+                    print(f"[IPRotator] Psiphon-0 ready (port {psiphon.socks_port})")
+                    if self.current_mode == "direct":
+                        self.current_mode = "psiphon"
+                else:
+                    self.psiphon_failed = True
+                    print(f"[IPRotator] Psiphon-0 failed")
+            except Exception as e:
+                self.psiphon_failed = True
+                print(f"[IPRotator] Psiphon-0 error: {e}")
+            sys.stdout.flush()
 
         # 3. Start Tor (~60MB)
         if self.tor_available:
