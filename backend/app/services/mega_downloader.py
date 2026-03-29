@@ -32,7 +32,7 @@ from app.database import get_connection
 
 # Configuration
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
-PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "16"))  # chunks per large file (MegaDownloader uses 10, we go 16)
+PARALLEL_CHUNKS = int(os.getenv("PARALLEL_CHUNKS", "6"))  # chunks per large file; 6 is safe for WARP/VPN IPs (Mega 429s at ~8+)
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB - files above this use parallel chunks
 # Max total memory for parallel chunks.  On a 2 GB plan, proxies + FastAPI
 # use ~500 MB, so we can safely use ~1.2 GB for parallel chunk buffers.
