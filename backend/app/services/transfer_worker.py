@@ -61,7 +61,12 @@ def _upload_single_file(storage, local_file, remote_key, job_id, fname, relative
 
 
 def _run_transfer(job_id: int):
-    """Main transfer pipeline: download -> exclude -> upload (parallel) -> notify."""
+    """Main transfer pipeline: download -> exclude -> upload (parallel) -> notify.
+
+    Supports resuming interrupted jobs:
+    - If job was 'uploading', skip download and go straight to upload from /data
+    - If job was 'downloading', re-download (with file-level resume support)
+    """
     conn = get_connection()
     job = conn.execute("SELECT * FROM transfer_jobs WHERE id = ?", (job_id,)).fetchone()
     conn.close()
@@ -74,36 +79,67 @@ def _run_transfer(job_id: int):
     storage_target = job["storage_target"]
     title = job["title"]
     slug = job["download_slug"]
+    previous_status = job["status"]
 
     downloader = MegaDownloader()
+    download_path = os.path.join(downloader.download_base, str(job_id))
 
     try:
-        # Step 1: Download from Mega (reset error state if retrying)
-        _update_job(job_id, status="downloading", progress=10, error_message="")
-        download_path = downloader.download_folder(
-            mega_link=job["mega_link"],
-            job_id=job_id,
-            excluded_files=excluded_files,
-        )
+        # Step 1: Download from Mega (skip if resuming from upload phase)
+        if previous_status == "uploading" and os.path.exists(download_path):
+            file_count = _count_files(download_path)
+            if file_count > 0:
+                print(f"[Resume] Job {job_id}: Skipping download, {file_count} files already on disk")
+            else:
+                print(f"[Resume] Job {job_id}: No files on disk despite uploading status, re-downloading")
+                _update_job(job_id, status="downloading", progress=10, error_message="")
+                download_path = downloader.download_folder(
+                    mega_link=job["mega_link"],
+                    job_id=job_id,
+                    excluded_files=excluded_files,
+                )
+        else:
+            _update_job(job_id, status="downloading", progress=10, error_message="")
+            download_path = downloader.download_folder(
+                mega_link=job["mega_link"],
+                job_id=job_id,
+                excluded_files=excluded_files,
+            )
 
         # Step 2: Upload to storage using parallel threads
         _update_job(job_id, status="uploading", progress=40)
         storage = get_storage(storage_target)
 
-        # Collect all files to upload
+        # Check which files have already been uploaded (for resume support)
+        conn = get_connection()
+        already_uploaded = set()
+        rows = conn.execute(
+            "SELECT file_path FROM content_items WHERE job_id = ?", (job_id,)
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            already_uploaded.add(row["file_path"])
+
+        # Collect all files to upload (skip already uploaded ones)
         files_to_upload = []
         for root, dirs, files in os.walk(download_path):
             for fname in files:
+                if fname.startswith('.'):
+                    continue
                 local_file = os.path.join(root, fname)
                 relative = os.path.relpath(local_file, download_path)
+                if relative in already_uploaded:
+                    print(f"[Upload] Skipping already uploaded: {relative}")
+                    continue
                 remote_key = f"{slug}/{relative}"
                 files_to_upload.append((local_file, remote_key, fname, relative))
 
-        total = len(files_to_upload)
+        total = len(files_to_upload) + len(already_uploaded)
         _update_job(job_id, total_files=total)
 
         # Parallel upload using ThreadPoolExecutor
-        uploaded = 0
+        uploaded = len(already_uploaded)
+        print(f"[Upload] {len(files_to_upload)} files to upload, {len(already_uploaded)} already done")
         with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
             futures = {}
             for local_file, remote_key, fname, relative in files_to_upload:
@@ -124,6 +160,7 @@ def _run_transfer(job_id: int):
             job_id,
             status="completed",
             progress=100,
+            uploaded_files=uploaded,
             completed_at=datetime.utcnow().isoformat(),
         )
 
