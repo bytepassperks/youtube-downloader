@@ -575,7 +575,7 @@ class PsiphonManager:
 # --- IP Rotation Manager -----------------------------------------------
 
 class IPRotator:
-    """Manages IP rotation: direct -> Tor -> Psiphon -> external proxies."""
+    """Manages IP rotation: direct -> Psiphon (fast) -> Tor (slow) -> external proxies."""
 
     def __init__(self):
         self.psiphon_instances: list = []
@@ -590,12 +590,12 @@ class IPRotator:
         self.tor_available = shutil.which("tor") is not None
         self.tor_failed = False
         self.rotation_count = 0
-        if self.tor_available:
-            print(f"[IPRotator] Tor found - free IP rotation available")
         if self.psiphon_available:
-            print(f"[IPRotator] Psiphon binary found - backup IP rotation available")
-        elif not self.tor_available:
-            print(f"[IPRotator] No proxy tools found (tor, psiphon)")
+            print(f"[IPRotator] Psiphon binary found - PRIMARY IP rotation (fast, single-hop)")
+        if self.tor_available:
+            print(f"[IPRotator] Tor found - BACKUP IP rotation (slower, 3-hop)")
+        if not self.psiphon_available and not self.tor_available:
+            print(f"[IPRotator] No proxy tools found (psiphon, tor)")
         if self.external_proxies:
             print(f"[IPRotator] {len(self.external_proxies)} external proxies configured")
         sys.stdout.flush()
@@ -638,28 +638,7 @@ class IPRotator:
         sys.stdout.flush()
         if self.current_mode == "direct":
             self.direct_exhausted = True
-        # Try Tor first (most reliable on cloud servers)
-        if self.tor_available and not self.tor_failed:
-            if self.current_mode == "tor" and self.tor_manager and self.tor_manager.connected:
-                # Already on Tor — rotate circuit for new IP
-                if self.tor_manager.rotate_ip():
-                    print(f"[IPRotator] Rotated Tor circuit (new exit IP)")
-                    sys.stdout.flush()
-                    return True
-            # Start Tor if not running
-            if not self.tor_manager:
-                self.tor_manager = TorManager()
-            if not self.tor_manager.connected:
-                if self.tor_manager.start():
-                    self.current_mode = "tor"
-                    print(f"[IPRotator] Rotated to tor")
-                    sys.stdout.flush()
-                    return True
-                else:
-                    self.tor_failed = True
-                    print(f"[IPRotator] Tor failed, will skip in future rotations")
-                    sys.stdout.flush()
-        # Try Psiphon (may not work on cloud servers)
+        # Try Psiphon first (faster — single-hop tunnel via CDN, ~5-15 MB/s)
         if self.psiphon_available and not self.psiphon_failed:
             if self.current_mode == "psiphon" and self.current_psiphon_idx < len(self.psiphon_instances):
                 psiphon = self.psiphon_instances[self.current_psiphon_idx]
@@ -682,6 +661,27 @@ class IPRotator:
                 else:
                     self.psiphon_failed = True
                     print(f"[IPRotator] Psiphon failed, will skip in future rotations")
+                    sys.stdout.flush()
+        # Try Tor as backup (slower — 3-hop relay, ~1-5 MB/s)
+        if self.tor_available and not self.tor_failed:
+            if self.current_mode == "tor" and self.tor_manager and self.tor_manager.connected:
+                # Already on Tor — rotate circuit for new IP
+                if self.tor_manager.rotate_ip():
+                    print(f"[IPRotator] Rotated Tor circuit (new exit IP)")
+                    sys.stdout.flush()
+                    return True
+            # Start Tor if not running
+            if not self.tor_manager:
+                self.tor_manager = TorManager()
+            if not self.tor_manager.connected:
+                if self.tor_manager.start():
+                    self.current_mode = "tor"
+                    print(f"[IPRotator] Rotated to tor (backup)")
+                    sys.stdout.flush()
+                    return True
+                else:
+                    self.tor_failed = True
+                    print(f"[IPRotator] Tor failed, will skip in future rotations")
                     sys.stdout.flush()
         # Try external proxies
         if self.external_proxies:
