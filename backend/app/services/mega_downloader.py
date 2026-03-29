@@ -56,7 +56,7 @@ def _ensure_megatools():
 class MegaDownloader:
     """Downloads files from Mega.nz public folder links using megadl CLI."""
 
-    def __init__(self, download_base: str = "/tmp/mega_downloads"):
+    def __init__(self, download_base: str = "/data/mega_downloads"):
         self.download_base = download_base
         self._megatools_available = _ensure_megatools()
 

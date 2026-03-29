@@ -70,10 +70,10 @@ def _run_transfer(job_id: int):
                 remote_key = f"{slug}/{relative}"
 
                 try:
+                    file_size = os.path.getsize(local_file)
                     storage.upload_file(local_file, remote_key)
 
                     # Record in database
-                    file_size = os.path.getsize(local_file)
                     conn = get_connection()
                     conn.execute(
                         """INSERT INTO content_items
@@ -83,6 +83,12 @@ def _run_transfer(job_id: int):
                     )
                     conn.commit()
                     conn.close()
+
+                    # Delete local file immediately after upload to save disk space
+                    try:
+                        os.remove(local_file)
+                    except OSError:
+                        pass
 
                     uploaded += 1
                     progress = 40 + int((uploaded / max(total, 1)) * 50)
