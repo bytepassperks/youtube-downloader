@@ -868,20 +868,20 @@ def _download_chunk(
         if sub_offset > 0:
             cipher.decrypt(b'\x00' * sub_offset)  # Advance cipher state
 
-        chunk_data = b''
-        for raw_chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-            if raw_chunk:
-                chunk_data += cipher.decrypt(raw_chunk)
-
-        # Ensure parent directory exists and write chunk to correct position
+        # Stream decrypted data directly to disk to avoid OOM on large files
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         # Use 'r+b' if file exists (pre-allocated), else create it
         mode = 'r+b' if os.path.exists(dest_path) else 'wb'
+        written = 0
         with open(dest_path, mode) as f:
             f.seek(start_byte)
-            f.write(chunk_data)
+            for raw_chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if raw_chunk:
+                    decrypted = cipher.decrypt(raw_chunk)
+                    f.write(decrypted)
+                    written += len(decrypted)
 
-        chunk_mb = len(chunk_data) / (1024 * 1024)
+        chunk_mb = written / (1024 * 1024)
         print(f"[Chunk-{chunk_id}] Done ({chunk_mb:.1f} MB, bytes {start_byte}-{end_byte})")
         sys.stdout.flush()
         return True
