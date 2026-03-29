@@ -61,3 +61,25 @@ async def startup():
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/api/test-psiphon")
+async def test_psiphon():
+    """Test if Psiphon can connect on this server."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _test():
+        from app.services.mega_downloader import PsiphonManager
+        pm = PsiphonManager(instance_id=99)
+        try:
+            connected = pm.start()
+            proxy = pm.get_proxy_url()
+            return {"connected": connected, "proxy": proxy}
+        finally:
+            pm.stop()
+
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as pool:
+        result = await loop.run_in_executor(pool, _test)
+    return result
