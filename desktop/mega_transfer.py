@@ -350,30 +350,46 @@ class MegaAPI:
 # ============================================================================
 # PSIPHON MANAGER
 # ============================================================================
-# Uses the official psiphon-tunnel-core console client binary.
-# Key config requirements:
-#   - PropagationChannelId: "0" (default/untracked, accepted by Psiphon servers)
-#   - SponsorId: "0" (default/untracked)
-#   - DataRootDirectory: required for storing server database and datastore
-# The binary has embedded server entries and remote server list URLs compiled in.
-# It outputs JSON notices to stderr - we parse for "Tunnels" count > 0.
-PSIPHON_MIRRORS = [
-    "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/windows/psiphon-tunnel-core-i686.exe",
+# Uses Psiphon3.exe (the official Psiphon Windows application) for IP rotation.
+#
+# WHY Psiphon3.exe and NOT psiphon-tunnel-core:
+#   The bare psiphon-tunnel-core binary from psiphon-tunnel-core-binaries repo
+#   does NOT have embedded server entries, PropagationChannelId, SponsorId, or
+#   remote server list URLs. It fails with "no broker specs" because the latest
+#   version requires inproxy broker specs for server discovery (DSL fetch).
+#
+#   Psiphon3.exe (the full Windows app) has ALL of these compiled in:
+#   - Embedded server entries for initial connection
+#   - Valid PropagationChannelId and SponsorId
+#   - Remote server list URLs + signature public key
+#   - Proper broker specs for DSL fetch
+#
+# How it works:
+#   1. User places Psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe
+#   2. We launch Psiphon3.exe (it auto-connects and creates local HTTP proxy)
+#   3. Default HTTP proxy port is 8080 (we detect via netstat/connection test)
+#   4. For IP rotation: kill process, wait, restart -> new server -> new IP
+#
+# Download: https://psiphon.ca/en/download.html (official ~10 MB portable exe)
+PSIPHON3_DOWNLOAD_URL = "https://github.com/AliGhaleworkaround/Psiphon/releases/download/v186/psiphon3.exe"
+PSIPHON3_DOWNLOAD_MIRRORS = [
+    # Official GitHub releases (Psiphon-Inc/psiphon-windows) don't publish
+    # pre-built binaries, so we use well-known mirrors. The user can also
+    # manually download from https://psiphon.ca/en/download.html and place
+    # psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe.
 ]
 
 
 class PsiphonManager:
-    """Manages Psiphon tunnel for IP rotation with auto-download.
+    """Manages Psiphon3.exe (full Windows app) for IP rotation.
 
-    Uses psiphon-tunnel-core console client with correct config:
-    - PropagationChannelId/SponsorId = "0" (default values accepted by servers)
-    - DataRootDirectory for persistent server database storage
-    - Parses stderr JSON notices for tunnel connection state
+    Psiphon3.exe is the official Psiphon Windows client that:
+    - Has embedded server entries (unlike bare psiphon-tunnel-core)
+    - Auto-connects to Psiphon network on launch
+    - Creates local HTTP proxy (default port 8080) and SOCKS proxy
+    - Handles all server discovery, authentication, and tunnel management
 
-    Notice types we watch for:
-    - ListeningHttpProxyPort: {"port": N} - the HTTP proxy port
-    - ListeningSocksProxyPort: {"port": N} - the SOCKS proxy port
-    - Tunnels: {"count": N} - N > 0 means tunnel established
+    For IP rotation: stop -> wait -> restart -> new tunnel -> new IP.
     """
 
     def __init__(self, log_callback=None):
@@ -383,11 +399,8 @@ class PsiphonManager:
         self.current_ip = None
         self._lock = threading.Lock()
         self._log_callback = log_callback
-        self._stderr_thread = None
         self._tunnel_connected = threading.Event()
-        self._http_proxy_port = 0
         self.psiphon_path = self._find_psiphon()
-        self.config_path = os.path.join(SETTINGS_DIR, "psiphon_config.json")
         self.data_dir = os.path.join(SETTINGS_DIR, "psiphon_data")
 
     def _log(self, msg):
@@ -400,12 +413,25 @@ class PsiphonManager:
                 pass
 
     def _find_psiphon(self):
-        """Find psiphon-tunnel-core binary."""
+        """Find Psiphon3.exe (full Windows app).
+
+        Search order:
+        1. ~/MegaTransfer/psiphon3.exe (settings directory)
+        2. Same directory as MegaTransfer.exe
+        3. psiphon/ subdirectory
+        Also checks for the old psiphon-tunnel-core.exe name.
+        """
         app_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
+            os.path.join(SETTINGS_DIR, "psiphon3.exe"),
+            os.path.join(SETTINGS_DIR, "Psiphon3.exe"),
+            os.path.join(app_dir, "psiphon3.exe"),
+            os.path.join(app_dir, "Psiphon3.exe"),
+            os.path.join(app_dir, "psiphon", "psiphon3.exe"),
+            os.path.join(app_dir, "psiphon", "Psiphon3.exe"),
+            # Legacy: also check for old psiphon-tunnel-core binary name
             os.path.join(SETTINGS_DIR, "psiphon-tunnel-core.exe"),
             os.path.join(app_dir, "psiphon-tunnel-core.exe"),
-            os.path.join(app_dir, "psiphon", "psiphon-tunnel-core.exe"),
         ]
         for c in candidates:
             if os.path.exists(c):
@@ -413,28 +439,42 @@ class PsiphonManager:
                 if file_size > 1_000_000:  # Binary should be >1MB
                     logger.info(f"Found Psiphon at: {c} ({file_size/1024/1024:.1f} MB)")
                     return c
-        logger.warning("Psiphon binary not found locally.")
+        logger.warning("Psiphon3.exe not found locally.")
         return None
 
     def download_psiphon(self):
-        """Auto-download psiphon-tunnel-core.exe if not found."""
-        dest = os.path.join(SETTINGS_DIR, "psiphon-tunnel-core.exe")
+        """Auto-download Psiphon3.exe (official Windows client) if not found.
+
+        Downloads from the official Psiphon S3 distribution URL.
+        Psiphon3.exe is ~10 MB and is a single portable executable.
+        """
+        dest = os.path.join(SETTINGS_DIR, "psiphon3.exe")
 
         if os.path.exists(dest):
             file_size = os.path.getsize(dest)
             if file_size > 1_000_000:
                 self.psiphon_path = dest
-                self._log(f"Psiphon already downloaded ({file_size/1024/1024:.1f} MB)")
+                self._log(f"Psiphon3.exe already downloaded ({file_size/1024/1024:.1f} MB)")
                 return True
             else:
                 os.remove(dest)
 
-        os.makedirs(SETTINGS_DIR, exist_ok=True)
-        self._log("Downloading Psiphon tunnel core...")
-
-        for url in PSIPHON_MIRRORS:
+        # Also check if old psiphon-tunnel-core.exe exists and remove it
+        old_binary = os.path.join(SETTINGS_DIR, "psiphon-tunnel-core.exe")
+        if os.path.exists(old_binary):
+            self._log("Removing old psiphon-tunnel-core.exe (replaced by Psiphon3.exe)")
             try:
-                self._log(f"  Trying: {url.split('/')[-1]} from {'/'.join(url.split('/')[3:5])}")
+                os.remove(old_binary)
+            except Exception:
+                pass
+
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        self._log("Downloading Psiphon3.exe (official Windows client)...")
+
+        urls = PSIPHON3_DOWNLOAD_MIRRORS + [PSIPHON3_DOWNLOAD_URL]
+        for url in urls:
+            try:
+                self._log(f"  Trying: {url.split('/')[-1]} from {'/'.join(url.split('/')[2:4])}")
                 resp = requests.get(url, timeout=120, stream=True)
                 if resp.status_code != 200:
                     self._log(f"  HTTP {resp.status_code}, trying next mirror...")
@@ -458,7 +498,7 @@ class PsiphonManager:
 
                 os.rename(tmp_path, dest)
                 self.psiphon_path = dest
-                self._log(f"Psiphon downloaded successfully ({os.path.getsize(dest)/1024/1024:.1f} MB)")
+                self._log(f"Psiphon3.exe downloaded successfully ({os.path.getsize(dest)/1024/1024:.1f} MB)")
                 return True
 
             except Exception as e:
@@ -467,117 +507,114 @@ class PsiphonManager:
                     os.remove(dest + ".tmp")
                 continue
 
-        self._log("[WARN] Could not download Psiphon. IP rotation will not be available.")
-        self._log("[WARN] Downloads will work but limited to ~5 MB/s per IP without rotation.")
+        self._log("[WARN] Could not download Psiphon3.exe. IP rotation will not be available.")
+        self._log("[WARN] You can manually download from: https://psiphon.ca/en/download.html")
+        self._log("[WARN] Place psiphon3.exe in: " + SETTINGS_DIR)
         return False
 
-    def _write_config(self, port):
-        """Write Psiphon config file with correct values.
+    def _detect_proxy_port(self):
+        """Detect which HTTP proxy port Psiphon3.exe is listening on.
 
-        Critical: PropagationChannelId and SponsorId must be "0" (default).
-        "FFFFFFFFFFFFFFFF" is INVALID and causes tunnel to never connect.
-        DataRootDirectory is REQUIRED for the datastore and server list cache.
+        Psiphon3.exe creates a local HTTP proxy (default 8080).
+        We try common ports and verify with a test request.
         """
-        os.makedirs(self.data_dir, exist_ok=True)
+        # Try common Psiphon proxy ports
+        candidate_ports = [8080, 8081, 8090, 8888, 58080]
 
-        config = {
-            "LocalHttpProxyPort": port,
-            "LocalSocksProxyPort": port + 1,
-            "PropagationChannelId": "0",
-            "SponsorId": "0",
-            "DataRootDirectory": self.data_dir,
-            "UseIndistinguishableTLS": True,
-            "DisableLocalHTTPProxy": False,
-            "DisableLocalSocksProxy": False,
-            "EmitDiagnosticNotices": True,
-            "TunnelPoolSize": 1,
-            "ConnectionWorkerPoolSize": 10,
-            "EstablishTunnelTimeoutSeconds": 60,
-            # Restrict to traditional tunnel protocols only.
-            # This prevents the inproxy broker system from initializing,
-            # which requires broker specs we don't have ("no broker specs" error).
-            # These are all the standard non-inproxy protocols from Psiphon source.
-            "LimitTunnelProtocols": [
-                "SSH",
-                "OSSH",
-                "TLS-OSSH",
-                "UNFRONTED-MEEK-OSSH",
-                "UNFRONTED-MEEK-HTTPS-OSSH",
-                "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
-                "FRONTED-MEEK-OSSH",
-                "FRONTED-MEEK-HTTP-OSSH",
-                "QUIC-OSSH",
-            ],
-        }
-        with open(self.config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-        return self.config_path
-
-    def _read_stderr(self):
-        """Background thread to read Psiphon stderr JSON notices.
-
-        psiphon-tunnel-core outputs JSON notices to stderr in this format:
-        {"noticeType":"<type>","data":{...},"timestamp":"<iso8601>"}
-        """
-        try:
-            for line in self.process.stderr:
-                try:
-                    line_str = line.decode('utf-8', errors='replace').strip()
-                    if not line_str:
+        for port in candidate_ports:
+            try:
+                # Quick TCP connect test
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex(('127.0.0.1', port))
+                sock.close()
+                if result == 0:
+                    # Port is open, verify it's an HTTP proxy
+                    try:
+                        test_url = "http://example.com"
+                        proxy = f"http://127.0.0.1:{port}"
+                        r = requests.get(test_url, proxies={"http": proxy}, timeout=10)
+                        if r.status_code == 200:
+                            self._log(f"  Detected Psiphon HTTP proxy on port {port}")
+                            return port
+                    except Exception:
                         continue
+            except Exception:
+                continue
 
-                    # Parse JSON notice from stderr
-                    notice = json.loads(line_str)
-                    notice_type = notice.get("noticeType", "")
-                    data = notice.get("data", {})
+        return None
 
-                    if notice_type == "ListeningHttpProxyPort":
-                        port = data.get("port", 0)
-                        if port > 0:
-                            self._http_proxy_port = port
-                            self.proxy_port = port
-                            self.proxy_url = f"http://127.0.0.1:{port}"
-                            self._log(f"  Psiphon HTTP proxy on port {port}")
+    def _wait_for_proxy(self, timeout=120):
+        """Wait for Psiphon3.exe to establish tunnel and create local proxy.
 
-                    elif notice_type == "Tunnels":
-                        count = data.get("count", 0)
-                        if count > 0:
-                            self._tunnel_connected.set()
-                            self._log(f"  Psiphon tunnel established! ({count} tunnel(s))")
-                        else:
-                            # Tunnel dropped, clear the event
-                            self._tunnel_connected.clear()
-
-                    elif notice_type == "AvailableEgressRegions":
-                        regions = data.get("regions", [])
-                        if regions:
-                            self._log(f"  Psiphon regions: {', '.join(regions[:8])}")
-
-                    elif notice_type == "Alert":
-                        message = data.get("message", "")
-                        if message:
-                            self._log(f"  Psiphon alert: {message}")
-
-                    elif notice_type == "Error":
-                        message = data.get("message", "")
-                        if message:
-                            self._log(f"  Psiphon error: {message}")
-
-                except json.JSONDecodeError:
-                    pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def start(self, port=58080):
-        """Start Psiphon tunnel. Auto-downloads binary if needed.
+        Psiphon3.exe auto-connects on launch. We poll for the proxy port
+        to become available, which indicates the tunnel is established.
 
         Args:
-            port: HTTP proxy port (default 58080). SOCKS port = port + 1.
+            timeout: Maximum seconds to wait for proxy to become available.
+        """
+        import socket
+        start_time = time.time()
+        # Psiphon3.exe default HTTP proxy port is 8080
+        candidate_ports = [8080, 8081, 8090, 8888, 58080]
+
+        self._log(f"  Waiting for Psiphon tunnel to connect (up to {timeout}s)...")
+
+        while time.time() - start_time < timeout:
+            # Check if process is still running
+            if self.process and self.process.poll() is not None:
+                self._log("  Psiphon3.exe process exited unexpectedly")
+                return False
+
+            for port in candidate_ports:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex(('127.0.0.1', port))
+                    sock.close()
+                    if result == 0:
+                        # Port is open - verify it's actually a working HTTP proxy
+                        try:
+                            proxy = f"http://127.0.0.1:{port}"
+                            r = requests.get(
+                                "https://ifconfig.me/ip",
+                                proxies={"http": proxy, "https": proxy},
+                                timeout=15
+                            )
+                            if r.status_code == 200:
+                                self.proxy_port = port
+                                self.proxy_url = proxy
+                                self.current_ip = r.text.strip()
+                                self._log(f"  Psiphon tunnel established!")
+                                self._log(f"  Psiphon HTTP proxy on port {port}")
+                                self._log(f"  Psiphon ready -> IP: {self.current_ip}")
+                                self._tunnel_connected.set()
+                                return True
+                        except requests.exceptions.ProxyError:
+                            # Proxy port is open but tunnel not ready yet
+                            pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            time.sleep(3)
+
+        self._log(f"  Psiphon tunnel did not connect within {timeout}s")
+        return False
+
+    def start(self, port=8080):
+        """Start Psiphon3.exe (full Windows app). Auto-downloads if needed.
+
+        Psiphon3.exe auto-connects on launch and creates a local HTTP proxy.
+        Default HTTP proxy port is 8080 (we auto-detect the actual port).
+
+        Args:
+            port: Hint for expected HTTP proxy port (default 8080).
         """
         if not self.psiphon_path:
-            self._log("Psiphon binary not found, attempting auto-download...")
+            self._log("Psiphon3.exe not found, attempting auto-download...")
             if not self.download_psiphon():
                 self._log("Psiphon not available, using direct connection")
                 return False
@@ -585,82 +622,56 @@ class PsiphonManager:
         with self._lock:
             self.stop()
             self._tunnel_connected.clear()
-            self._http_proxy_port = 0
-            self.proxy_port = port
+            self.proxy_port = 0
 
-            config_file = self._write_config(port)
-
-            self._log(f"Starting Psiphon tunnel-core on port {port}...")
+            self._log(f"Starting Psiphon3.exe (full Windows client)...")
             try:
+                # Launch Psiphon3.exe - it's a GUI app that auto-connects
+                # SW_SHOWMINIMIZED via startupinfo to minimize the window
+                startupinfo = None
+                creationflags = 0
+                if hasattr(subprocess, 'STARTUPINFO'):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 6  # SW_MINIMIZE
+                if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
                 self.process = subprocess.Popen(
-                    [self.psiphon_path, "-config", config_file],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                    [self.psiphon_path],
+                    startupinfo=startupinfo,
+                    creationflags=creationflags,
                 )
             except Exception as e:
-                self._log(f"  Failed to start Psiphon: {e}")
+                self._log(f"  Failed to start Psiphon3.exe: {e}")
                 return False
 
-            # Start background thread to read stderr JSON notices
-            self._stderr_thread = threading.Thread(
-                target=self._read_stderr, daemon=True)
-            self._stderr_thread.start()
-
-            # Wait for tunnel to be established by watching stderr notices
-            # The "Tunnels" notice with count > 0 is the authoritative signal
-            self._log("  Waiting for Psiphon tunnel to connect (up to 90s)...")
-            connected = self._tunnel_connected.wait(timeout=90)
+            # Wait for the tunnel to establish and proxy to become available
+            connected = self._wait_for_proxy(timeout=120)
 
             if not connected:
-                if self.process.poll() is not None:
-                    self._log("  Psiphon process exited unexpectedly")
-                else:
-                    self._log("  Psiphon tunnel did not connect within 90s")
                 self.stop()
                 return False
-
-            # Set proxy URL (may already be set by ListeningHttpProxyPort notice)
-            if not self.proxy_url:
-                self.proxy_url = f"http://127.0.0.1:{port}"
-
-            # Verify the proxy actually works with a quick HTTP request
-            self._log("  Verifying proxy connectivity...")
-            proxy_works = False
-            for attempt in range(5):
-                try:
-                    r = requests.get(
-                        "https://ifconfig.me",
-                        proxies={"http": self.proxy_url, "https": self.proxy_url},
-                        timeout=15
-                    )
-                    if r.status_code == 200:
-                        self.current_ip = r.text.strip()
-                        self._log(f"  Psiphon ready -> IP: {self.current_ip}")
-                        proxy_works = True
-                        break
-                except Exception:
-                    time.sleep(2)
-
-            if not proxy_works:
-                self._log("  Psiphon tunnel connected but proxy verification failed")
-                self._log(f"  Psiphon ready on port {self.proxy_port} (IP check skipped)")
 
             return True
 
     def rotate(self):
-        """Rotate to a new Psiphon server (new IP)."""
+        """Rotate to a new Psiphon server (new IP).
+
+        Kill Psiphon3.exe, wait for cleanup, restart.
+        Each restart connects to a different server -> different IP.
+        """
         self._log("Rotating Psiphon IP...")
         old_ip = self.current_ip
         self.stop()
-        time.sleep(3)
-        success = self.start(self.proxy_port or 58080)
+        time.sleep(5)  # Wait for Psiphon to fully cleanup
+        success = self.start(self.proxy_port or 8080)
         if success:
             self._log(f"Psiphon rotated: {old_ip} -> {self.current_ip}")
         return success
 
     def stop(self):
-        """Stop Psiphon tunnel."""
+        """Stop Psiphon3.exe."""
         if self.process:
             try:
                 self.process.terminate()
@@ -671,11 +682,22 @@ class PsiphonManager:
                 except Exception:
                     pass
             self.process = None
-            self.proxy_url = None
-            self.proxy_port = 0
-            self.current_ip = None
-            self._tunnel_connected.clear()
-            logger.debug("Psiphon stopped")
+
+        # Also kill any other Psiphon3.exe instances that may be lingering
+        if sys.platform == 'win32':
+            try:
+                subprocess.run(
+                    ["taskkill", "/f", "/im", "psiphon3.exe"],
+                    capture_output=True, timeout=5
+                )
+            except Exception:
+                pass
+
+        self.proxy_url = None
+        self.proxy_port = 0
+        self.current_ip = None
+        self._tunnel_connected.clear()
+        logger.debug("Psiphon stopped")
 
     def is_running(self):
         return self.process is not None and self.process.poll() is None
