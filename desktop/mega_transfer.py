@@ -371,12 +371,11 @@ class MegaAPI:
 #   4. For IP rotation: kill process, wait, restart -> new server -> new IP
 #
 # Download: https://psiphon.ca/en/download.html (official ~10 MB portable exe)
-PSIPHON3_DOWNLOAD_URL = "https://github.com/AliGhaleworkaround/Psiphon/releases/download/v186/psiphon3.exe"
+PSIPHON3_DOWNLOAD_URL = "https://psiphon.ca/psiphon3.exe"
 PSIPHON3_DOWNLOAD_MIRRORS = [
-    # Official GitHub releases (Psiphon-Inc/psiphon-windows) don't publish
-    # pre-built binaries, so we use well-known mirrors. The user can also
-    # manually download from https://psiphon.ca/en/download.html and place
-    # psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe.
+    "https://psiphon.ca/psiphon3.exe",
+    # Fallback: user can manually download from https://psiphon.ca/en/download.html
+    # and place psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe.
 ]
 
 
