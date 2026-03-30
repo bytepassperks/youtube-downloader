@@ -105,6 +105,25 @@ async def start_job(job_id: int, admin: dict = Depends(get_admin_user)):
     return {"message": "Job started", "job_id": job_id}
 
 
+@router.post("/{job_id}/stop")
+async def stop_job(job_id: int, admin: dict = Depends(get_admin_user)):
+    conn = get_connection()
+    job = conn.execute("SELECT status FROM transfer_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] not in ("downloading", "uploading"):
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Job is not active (status: {job['status']})")
+    conn.execute(
+        "UPDATE transfer_jobs SET status = 'failed', error_message = 'Stopped by admin' WHERE id = ?",
+        (job_id,),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Job stopped", "job_id": job_id}
+
+
 @router.delete("/{job_id}")
 async def delete_job(job_id: int, admin: dict = Depends(get_admin_user)):
     conn = get_connection()
