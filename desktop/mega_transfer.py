@@ -984,6 +984,8 @@ class DownloadEngine:
                     part_num = 1
                     buffer = b''
                     downloaded = 0
+                    stream_start = time.time()
+                    last_progress_log = stream_start
                     ctr = CryptoCounter.new(128, initial_value=(iv_int << 64))
                     cipher = AES.new(a32_to_str(key), AES.MODE_CTR, counter=ctr)
 
@@ -998,6 +1000,7 @@ class DownloadEngine:
                         decrypted = cipher.decrypt(chunk)
                         buffer += decrypted
                         downloaded += len(chunk)
+                        now = time.time()
 
                         while len(buffer) >= chunk_size:
                             part = self.s3_client.upload_part(
@@ -1008,6 +1011,15 @@ class DownloadEngine:
                             buffer = buffer[chunk_size:]
                             part_num += 1
 
+                        # Log progress every 5 seconds
+                        if now - last_progress_log >= 5:
+                            elapsed = now - stream_start
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            pct = downloaded * 100 / file_size if file_size > 0 else 0
+                            remaining = (file_size - downloaded) / speed if speed > 0 else 0
+                            eta_str = f"{int(remaining)}s" if remaining < 120 else f"{int(remaining/60)}m"
+                            self.log(f"  {pct:.0f}% | {speed/1024/1024:.1f} MB/s | {downloaded/1024/1024:.0f}/{file_size/1024/1024:.0f} MB | ETA: {eta_str}")
+                            last_progress_log = now
                         if self.progress_callback:
                             self.progress_callback(downloaded, file_size, name)
 
@@ -1021,8 +1033,10 @@ class DownloadEngine:
                         Bucket=self.settings['idrive_bucket'], Key=s3_key,
                         UploadId=upload_id, MultipartUpload={'Parts': parts})
 
+                    elapsed = time.time() - stream_start
+                    avg_speed = file_size / elapsed if elapsed > 0 else 0
                     proxy_label = "Psiphon" if use_proxy else "direct"
-                    self.log(f"  Completed via {proxy_label}")
+                    self.log(f"  Completed via {proxy_label}: {file_size/1024/1024:.0f} MB in {elapsed:.0f}s ({avg_speed/1024/1024:.1f} MB/s avg)")
                     return True
 
                 except Exception as e:
@@ -1058,6 +1072,9 @@ class DownloadEngine:
         try:
             chunk_size = file_size // num_threads
             downloaded = [0]
+            chunks_done = [0]
+            dl_start_time = [time.time()]
+            last_log_time = [time.time()]
             lock = threading.Lock()
 
             def dl_and_upload(idx, start, end):
@@ -1076,6 +1093,17 @@ class DownloadEngine:
 
                 with lock:
                     downloaded[0] += len(data)
+                    chunks_done[0] += 1
+                    now = time.time()
+                    # Log progress every 5 seconds or on chunk completion
+                    if now - last_log_time[0] >= 5 or chunks_done[0] == num_threads:
+                        elapsed = now - dl_start_time[0]
+                        speed = downloaded[0] / elapsed if elapsed > 0 else 0
+                        pct = downloaded[0] * 100 / file_size if file_size > 0 else 0
+                        remaining = (file_size - downloaded[0]) / speed if speed > 0 else 0
+                        eta_str = f"{int(remaining)}s" if remaining < 120 else f"{int(remaining/60)}m"
+                        self.log(f"  [{chunks_done[0]}/{num_threads}] {pct:.0f}% | {speed/1024/1024:.1f} MB/s | {downloaded[0]/1024/1024:.0f}/{file_size/1024/1024:.0f} MB | ETA: {eta_str}")
+                        last_log_time[0] = now
                     if self.progress_callback:
                         self.progress_callback(downloaded[0], file_size, name)
 
@@ -1122,6 +1150,9 @@ class DownloadEngine:
                             parts[idx] = result
 
             if all(parts):
+                elapsed = time.time() - dl_start_time[0]
+                avg_speed = file_size / elapsed if elapsed > 0 else 0
+                self.log(f"  Download complete: {file_size/1024/1024:.0f} MB in {elapsed:.0f}s ({avg_speed/1024/1024:.1f} MB/s avg)")
                 self.s3_client.complete_multipart_upload(
                     Bucket=self.settings['idrive_bucket'], Key=s3_key,
                     UploadId=upload_id,
@@ -1164,6 +1195,9 @@ class DownloadEngine:
         self.log(f"  {num_threads}-thread parallel download to disk ({file_size/1024/1024:.0f} MB)")
         chunk_size = file_size // num_threads
         downloaded = [0]
+        chunks_done = [0]
+        dl_start_time = [time.time()]
+        last_log_time = [time.time()]
         lock = threading.Lock()
         chunks = [None] * num_threads
 
@@ -1178,6 +1212,16 @@ class DownloadEngine:
                 chunks[idx] = data
                 with lock:
                     downloaded[0] += len(data)
+                    chunks_done[0] += 1
+                    now = time.time()
+                    if now - last_log_time[0] >= 5 or chunks_done[0] == num_threads:
+                        elapsed = now - dl_start_time[0]
+                        speed = downloaded[0] / elapsed if elapsed > 0 else 0
+                        pct = downloaded[0] * 100 / file_size if file_size > 0 else 0
+                        remaining = (file_size - downloaded[0]) / speed if speed > 0 else 0
+                        eta_str = f"{int(remaining)}s" if remaining < 120 else f"{int(remaining/60)}m"
+                        self.log(f"  [{chunks_done[0]}/{num_threads}] {pct:.0f}% | {speed/1024/1024:.1f} MB/s | {downloaded[0]/1024/1024:.0f}/{file_size/1024/1024:.0f} MB | ETA: {eta_str}")
+                        last_log_time[0] = now
                     if self.progress_callback:
                         self.progress_callback(downloaded[0], file_size, name)
 
@@ -1214,6 +1258,9 @@ class DownloadEngine:
                     dl_chunk(idx, sb, eb)
 
         if all(chunks):
+            elapsed = time.time() - dl_start_time[0]
+            avg_speed = file_size / elapsed if elapsed > 0 else 0
+            self.log(f"  Download complete: {file_size/1024/1024:.0f} MB in {elapsed:.0f}s ({avg_speed/1024/1024:.1f} MB/s avg)")
             with open(local_path, 'wb') as f:
                 for chunk in chunks:
                     f.write(chunk)
