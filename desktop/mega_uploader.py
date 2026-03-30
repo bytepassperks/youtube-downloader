@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import boto3
 from botocore.config import Config as BotoConfig
+from boto3.s3.transfer import TransferConfig
 
 # ============================================================================
 # LOGGING
@@ -70,7 +71,7 @@ DEFAULT_SETTINGS = {
     "local_folder": "",
     "s3_prefix": "",  # Auto-detected from folder name if empty
     "exclude_files": ["edollarearn.com.url", "Upgrade Your Account VIP - edollarearn.com.txt"],
-    "upload_threads": 8,
+    "upload_threads": 16,
     "delete_after_upload": False,
 }
 
@@ -131,10 +132,17 @@ class Uploader:
                 connect_timeout=30,
                 read_timeout=300,
                 retries={'max_attempts': 3, 'mode': 'adaptive'},
-                max_pool_connections=20,
+                max_pool_connections=50,
             )
         )
-        self.log("S3 client initialized")
+        # TransferConfig: parallel part uploads within each file
+        self.transfer_config = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,   # 8 MB -> use multipart
+            multipart_chunksize=8 * 1024 * 1024,    # 8 MB parts
+            max_concurrency=10,                      # 10 parallel parts per file
+            use_threads=True,
+        )
+        self.log("S3 client initialized (parallel uploads enabled)")
 
     def _delete_excluded_files(self, folder_path):
         """Delete excluded files from folder and all subfolders."""
@@ -192,31 +200,19 @@ class Uploader:
             self.log(f"  Could not check existing S3 files: {e}")
         return uploaded
 
-    def _upload_part_with_retry(self, s3_key, upload_id, part_num, data, rel_path, max_retries=3):
-        """Upload a single multipart part with retry logic."""
-        for attempt in range(max_retries):
-            try:
-                part = self.s3_client.upload_part(
-                    Bucket=self.settings['idrive_bucket'],
-                    Key=s3_key, UploadId=upload_id,
-                    PartNumber=part_num, Body=data)
-                return part
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    self.log(f"  [{rel_path}] Part {part_num} failed (attempt {attempt+1}), retrying in {wait_time}s: {e}")
-                    time.sleep(wait_time)
-                else:
-                    raise
-
     def _upload_file(self, local_path, s3_key, file_size, file_idx):
-        """Upload a single file to S3 with retry logic."""
+        """Upload a single file to S3 using boto3's optimized transfer manager.
+        
+        Uses TransferConfig with parallel part uploads (10 concurrent parts per file)
+        for maximum throughput. Retries entire file up to 3 times on failure.
+        """
         if self._cancelled:
             return False
 
         rel_path = s3_key.split('/', 1)[1] if '/' in s3_key else s3_key
         size_mb = file_size / 1024 / 1024
         max_file_retries = 3
+        bucket = self.settings['idrive_bucket']
 
         for file_attempt in range(max_file_retries):
             if self._cancelled:
@@ -225,60 +221,14 @@ class Uploader:
             try:
                 start = time.time()
 
-                if file_size > 16 * 1024 * 1024:  # >16 MB: multipart
-                    chunk_size = 16 * 1024 * 1024  # 16 MB parts (smaller for iDrive compatibility)
-                    mpu = self.s3_client.create_multipart_upload(
-                        Bucket=self.settings['idrive_bucket'], Key=s3_key)
-                    upload_id = mpu['UploadId']
-
-                    try:
-                        parts = []
-                        part_num = 1
-                        uploaded_bytes = 0
-
-                        with open(local_path, 'rb') as f:
-                            while True:
-                                if self._cancelled:
-                                    self.s3_client.abort_multipart_upload(
-                                        Bucket=self.settings['idrive_bucket'],
-                                        Key=s3_key, UploadId=upload_id)
-                                    return False
-
-                                data = f.read(chunk_size)
-                                if not data:
-                                    break
-
-                                part = self._upload_part_with_retry(
-                                    s3_key, upload_id, part_num, data, rel_path)
-                                parts.append({'ETag': part['ETag'], 'PartNumber': part_num})
-                                uploaded_bytes += len(data)
-                                part_num += 1
-
-                                pct = uploaded_bytes * 100 // file_size
-                                elapsed = time.time() - start
-                                speed = uploaded_bytes / elapsed if elapsed > 0 else 0
-                                self.log(f"  [{file_idx}] {rel_path}: {pct}% ({speed/1024/1024:.1f} MB/s)")
-
-                        self.s3_client.complete_multipart_upload(
-                            Bucket=self.settings['idrive_bucket'], Key=s3_key,
-                            UploadId=upload_id,
-                            MultipartUpload={'Parts': parts})
-
-                    except Exception:
-                        try:
-                            self.s3_client.abort_multipart_upload(
-                                Bucket=self.settings['idrive_bucket'],
-                                Key=s3_key, UploadId=upload_id)
-                        except Exception:
-                            pass
-                        raise
-
-                else:  # Small file: direct upload with retry
-                    with open(local_path, 'rb') as f:
-                        file_data = f.read()
-                    self.s3_client.put_object(
-                        Bucket=self.settings['idrive_bucket'],
-                        Key=s3_key, Body=file_data)
+                # Use boto3's high-level upload_file with TransferConfig
+                # This automatically handles multipart + parallel part uploads
+                self.s3_client.upload_file(
+                    Filename=local_path,
+                    Bucket=bucket,
+                    Key=s3_key,
+                    Config=self.transfer_config,
+                )
 
                 elapsed = time.time() - start
                 speed = file_size / elapsed if elapsed > 0 else 0
