@@ -80,7 +80,7 @@ DEFAULT_SETTINGS = {
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "portal_domain": "https://bytecourses.online",
-    "parallel_threads": 8,
+    "parallel_threads": 16,
     "exclude_files": ["edollarearn.com.url", "Upgrade Your Account VIP - edollarearn.com.txt"],
     "download_path": os.path.join(os.path.expanduser("~"), "MegaTransfer", "downloads"),
     "download_mode": "direct_to_s3",  # "direct_to_s3", "local_and_s3", "local_only"
@@ -697,12 +697,12 @@ class DownloadEngine:
         return False
 
     def _parallel_download(self, url, file_info, proxy, s3_key):
-        """Multi-threaded parallel download for medium files."""
+        """Multi-threaded parallel download using byte-range requests (MegaDownloader-style)."""
         file_size = file_info['size']
         key = file_info['key']
         iv_int = file_info['iv_int']
         name = file_info['name']
-        num_threads = self.settings.get('parallel_threads', 8)
+        num_threads = self.settings.get('parallel_threads', 16)
 
         self.log(f"  {num_threads}-thread parallel download ({file_size/1024/1024:.0f} MB)")
 
@@ -801,7 +801,86 @@ class DownloadEngine:
             return False
 
     def _save_to_local(self, url, file_info, proxy, local_path):
-        """Download and decrypt a file, saving to local disk."""
+        """Download and decrypt a file, saving to local disk with parallel connections."""
+        file_size = file_info['size']
+        key = file_info['key']
+        iv_int = file_info['iv_int']
+        name = file_info['name']
+        small_threshold = self.settings.get('small_file_threshold_mb', 20) * 1024 * 1024
+        num_threads = self.settings.get('parallel_threads', 16)
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        if file_size < small_threshold:
+            # Small files: single-stream to avoid overhead
+            return self._save_to_local_single(url, file_info, proxy, local_path)
+
+        # Parallel byte-range download for larger files
+        self.log(f"  {num_threads}-thread parallel download to disk ({file_size/1024/1024:.0f} MB)")
+        chunk_size = file_size // num_threads
+        downloaded = [0]
+        lock = threading.Lock()
+        chunks = [None] * num_threads
+
+        def dl_chunk(idx, start, end):
+            if self._cancelled:
+                return
+            data = self._download_chunk(url, start, end, proxy, key, iv_int, idx, name)
+            if data:
+                actual_end = min(end, file_size - 1)
+                expected_size = actual_end - start + 1
+                data = data[:expected_size]
+                chunks[idx] = data
+                with lock:
+                    downloaded[0] += len(data)
+                    if self.progress_callback:
+                        self.progress_callback(downloaded[0], file_size, name)
+
+        ranges_list = []
+        for i in range(num_threads):
+            start_byte = i * chunk_size
+            end_byte = file_size - 1 if i == num_threads - 1 else (i + 1) * chunk_size - 1
+            ranges_list.append((i, start_byte, end_byte))
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = {}
+            for i, start_byte, end_byte in ranges_list:
+                f = executor.submit(dl_chunk, i, start_byte, end_byte)
+                futures[f] = i
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.error(f"Chunk {futures[f]} error: {e}")
+
+        # Retry failed chunks
+        failed = [i for i, c in enumerate(chunks) if c is None]
+        if failed:
+            self.log(f"  Retrying {len(failed)} failed chunks...")
+            if self._handle_quota():
+                new_proxy = self._get_proxy()
+                new_url = self.mega_api.get_download_url(
+                    file_info['node_id'], file_info['folder_id'], new_proxy)
+                if not new_url:
+                    new_url = url
+                for idx in failed:
+                    _, sb, eb = ranges_list[idx]
+                    time.sleep(2)
+                    dl_chunk(idx, sb, eb)
+
+        if all(chunks):
+            with open(local_path, 'wb') as f:
+                for chunk in chunks:
+                    f.write(chunk)
+            self.log(f"  Saved to: {local_path}")
+            return True
+        else:
+            still_failed = [i for i, c in enumerate(chunks) if c is None]
+            self.log(f"  Still failed: chunks {still_failed}")
+            return False
+
+    def _save_to_local_single(self, url, file_info, proxy, local_path):
+        """Single-stream download for small files to local disk."""
         file_size = file_info['size']
         key = file_info['key']
         iv_int = file_info['iv_int']
@@ -939,14 +1018,12 @@ class DownloadEngine:
             return False
 
         else:
-            # direct_to_s3: stream directly to S3 (fastest)
+            # direct_to_s3: stream directly to S3
             if file_size < small_threshold:
                 self.log(f"  Single-stream (small file)")
                 return self._single_stream_download(url, file_info, proxy, s3_key)
-            elif file_size > large_threshold:
-                self.log(f"  Single-stream (large file, avoiding OOM)")
-                return self._single_stream_download(url, file_info, proxy, s3_key)
             else:
+                # Parallel multi-connection for all files >= small threshold
                 return self._parallel_download(url, file_info, proxy, s3_key)
 
     def get_uploaded_files(self, s3_prefix):
