@@ -28,7 +28,7 @@ export default function NewJobPage() {
       const job = await createJob({
         title,
         mega_link: megaLink,
-        excluded_files: excluded,
+        exclude_files: excluded,
         storage_target: storageTarget,
       });
 

@@ -100,10 +100,14 @@ async def update_settings(
             )
     conn.commit()
     conn.close()
-    # Return full settings
+    # Return full settings with masking (same as GET endpoint)
     result = {}
     for key in _SETTING_KEYS:
-        result[key] = get_setting(key)
+        val = get_setting(key)
+        if key in _SENSITIVE_KEYS and val:
+            result[key] = _mask(val)
+        else:
+            result[key] = val
     return result
 
 

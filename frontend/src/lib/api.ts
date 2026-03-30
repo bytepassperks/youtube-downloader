@@ -55,7 +55,7 @@ export function logout() {
 export async function createJob(data: {
   title: string;
   mega_link: string;
-  excluded_files: string[];
+  exclude_files: string[];
   storage_target: string;
 }) {
   const res = await request("/api/jobs/", {

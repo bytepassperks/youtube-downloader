@@ -197,9 +197,11 @@ def _run_transfer(job_id: int):
             upload_speed=f"{total_uploaded / max(total_elapsed / 60, 0.01):.0f} files/min",
         )
 
-        # Send Telegram notification
+        # Send Telegram notification (use DB setting for portal URL, not hardcoded config)
         try:
-            portal_url = f"{settings.PORTAL_BASE_URL}/content/{slug}"
+            from app.routes.settings import get_setting
+            portal_base = get_setting("portal_base_url") or settings.PORTAL_BASE_URL
+            portal_url = f"{portal_base}/content/{slug}"
             bot = TelegramBot()
             bot.send_transfer_complete_sync(title, portal_url)
             _update_job(job_id, telegram_sent=1)
