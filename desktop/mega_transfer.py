@@ -367,8 +367,9 @@ class MegaAPI:
 # How it works:
 #   1. User places Psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe
 #   2. We launch Psiphon3.exe (it auto-connects and creates local HTTP proxy)
-#   3. Default HTTP proxy port is 8080 (we detect via netstat/connection test)
-#   4. For IP rotation: kill process, wait, restart -> new server -> new IP
+#   3. We pre-configure registry to set fixed HTTP proxy port 8080, SOCKS 1080
+#   4. We suppress browser/GUI via registry: UserSkipBrowser=1, SystrayMinimize=1
+#   5. For IP rotation: kill process, wait, restart -> new server -> new IP
 #
 # Download: https://psiphon.ca/en/download.html (official ~10 MB portable exe)
 PSIPHON3_DOWNLOAD_URL = "https://psiphon.ca/psiphon3.exe"
@@ -378,6 +379,10 @@ PSIPHON3_DOWNLOAD_MIRRORS = [
     # and place psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe.
 ]
 
+# Fixed proxy ports we configure in registry before launching Psiphon3.exe
+PSIPHON_HTTP_PROXY_PORT = 8080
+PSIPHON_SOCKS_PROXY_PORT = 1080
+
 
 class PsiphonManager:
     """Manages Psiphon3.exe (full Windows app) for IP rotation.
@@ -385,8 +390,14 @@ class PsiphonManager:
     Psiphon3.exe is the official Psiphon Windows client that:
     - Has embedded server entries (unlike bare psiphon-tunnel-core)
     - Auto-connects to Psiphon network on launch
-    - Creates local HTTP proxy (default port 8080) and SOCKS proxy
+    - Creates local HTTP proxy and SOCKS proxy
     - Handles all server discovery, authentication, and tunnel management
+
+    We pre-configure the Windows registry before launching to:
+    - Set fixed proxy ports (HTTP=8080, SOCKS=1080) so we know where to connect
+    - Suppress browser opening (UserSkipBrowser=1)
+    - Skip system proxy changes (UserSkipProxySettings=1) to avoid side effects
+    - Enable systray minimize (SystrayMinimize=1) so the window stays hidden
 
     For IP rotation: stop -> wait -> restart -> new tunnel -> new IP.
     """
@@ -511,19 +522,56 @@ class PsiphonManager:
         self._log("[WARN] Place psiphon3.exe in: " + SETTINGS_DIR)
         return False
 
-    def _detect_proxy_port(self):
-        """Detect which HTTP proxy port Psiphon3.exe is listening on.
+    def _configure_registry(self):
+        """Pre-configure Psiphon3 Windows registry to run silently.
 
-        Psiphon3.exe creates a local HTTP proxy (default 8080).
-        We try common ports and verify with a test request.
+        Sets registry values under HKCU\Software\Psiphon3 to:
+        - UserSkipBrowser=1: Don't open browser on connect
+        - UserSkipProxySettings=1: Don't change system proxy settings
+        - SystrayMinimize=1: Minimize to system tray
+        - LocalHTTPProxyPort=8080: Fixed HTTP proxy port
+        - LocalSOCKSProxyPort=1080: Fixed SOCKS proxy port
+
+        Source: Reverse-engineered from Psiphon-Inc/psiphon-windows source code
+        (usersettings.cpp, psiphon_tunnel_core_utilities.cpp)
         """
-        # Try common Psiphon proxy ports
-        candidate_ports = [8080, 8081, 8090, 8888, 58080]
+        if sys.platform != 'win32':
+            return
+
+        try:
+            import winreg
+            key_path = r"Software\Psiphon3"
+            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                     winreg.KEY_SET_VALUE)
+            # Suppress browser opening on connect
+            winreg.SetValueEx(key, "UserSkipBrowser", 0, winreg.REG_DWORD, 1)
+            # Don't change Windows system proxy settings
+            winreg.SetValueEx(key, "UserSkipProxySettings", 0, winreg.REG_DWORD, 1)
+            # Minimize to systray instead of taskbar
+            winreg.SetValueEx(key, "SystrayMinimize", 0, winreg.REG_DWORD, 1)
+            # Set fixed proxy ports so we know exactly where to connect
+            winreg.SetValueEx(key, "LocalHTTPProxyPort", 0, winreg.REG_DWORD,
+                              PSIPHON_HTTP_PROXY_PORT)
+            winreg.SetValueEx(key, "LocalSOCKSProxyPort", 0, winreg.REG_DWORD,
+                              PSIPHON_SOCKS_PROXY_PORT)
+            winreg.CloseKey(key)
+            self._log("  Psiphon registry configured (silent mode, ports 8080/1080)")
+        except Exception as e:
+            self._log(f"  Warning: Could not configure registry: {e}")
+            self._log("  Psiphon may open browser or use random ports")
+
+    def _detect_proxy_port(self):
+        """Detect Psiphon HTTP proxy port.
+
+        First checks the fixed port we configured (8080), then falls back to
+        scanning common ports and finally tries to find ports via netstat.
+        """
+        import socket
+        # Primary: check the port we configured in registry
+        candidate_ports = [PSIPHON_HTTP_PROXY_PORT, 8081, 8090, 8888, 58080]
 
         for port in candidate_ports:
             try:
-                # Quick TCP connect test
-                import socket
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
                 result = sock.connect_ex(('127.0.0.1', port))
@@ -531,9 +579,9 @@ class PsiphonManager:
                 if result == 0:
                     # Port is open, verify it's an HTTP proxy
                     try:
-                        test_url = "http://example.com"
                         proxy = f"http://127.0.0.1:{port}"
-                        r = requests.get(test_url, proxies={"http": proxy}, timeout=10)
+                        r = requests.get("http://example.com",
+                                         proxies={"http": proxy}, timeout=10)
                         if r.status_code == 200:
                             self._log(f"  Detected Psiphon HTTP proxy on port {port}")
                             return port
@@ -542,23 +590,52 @@ class PsiphonManager:
             except Exception:
                 continue
 
+        # Fallback: try to find Psiphon's listening ports via netstat
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if "LISTENING" in line and "127.0.0.1:" in line:
+                        parts = line.split()
+                        for p in parts:
+                            if p.startswith("127.0.0.1:"):
+                                port = int(p.split(":")[1])
+                                if 1024 < port < 65535:
+                                    try:
+                                        proxy = f"http://127.0.0.1:{port}"
+                                        r = requests.get(
+                                            "http://example.com",
+                                            proxies={"http": proxy}, timeout=5
+                                        )
+                                        if r.status_code == 200:
+                                            self._log(f"  Found proxy on port {port} via netstat")
+                                            return port
+                                    except Exception:
+                                        continue
+        except Exception:
+            pass
+
         return None
 
-    def _wait_for_proxy(self, timeout=120):
+    def _wait_for_proxy(self, timeout=60):
         """Wait for Psiphon3.exe to establish tunnel and create local proxy.
 
-        Psiphon3.exe auto-connects on launch. We poll for the proxy port
-        to become available, which indicates the tunnel is established.
+        Psiphon3.exe auto-connects on launch. We poll the fixed HTTP proxy port
+        (8080, set via registry) until it responds, indicating tunnel is up.
 
         Args:
             timeout: Maximum seconds to wait for proxy to become available.
         """
         import socket
         start_time = time.time()
-        # Psiphon3.exe default HTTP proxy port is 8080
-        candidate_ports = [8080, 8081, 8090, 8888, 58080]
+        # We configured port 8080 in registry; also check a few fallbacks
+        primary_port = PSIPHON_HTTP_PROXY_PORT
+        fallback_ports = [8081, 8090, 8888, 58080]
+        poll_interval = 2  # seconds between checks
 
-        self._log(f"  Waiting for Psiphon tunnel to connect (up to {timeout}s)...")
+        self._log(f"  Waiting for Psiphon tunnel (port {primary_port}, up to {timeout}s)...")
 
         while time.time() - start_time < timeout:
             # Check if process is still running
@@ -566,39 +643,67 @@ class PsiphonManager:
                 self._log("  Psiphon3.exe process exited unexpectedly")
                 return False
 
-            for port in candidate_ports:
+            elapsed = int(time.time() - start_time)
+
+            # Check primary port first, then fallbacks
+            ports_to_check = [primary_port] + fallback_ports
+            for port in ports_to_check:
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(2)
                     result = sock.connect_ex(('127.0.0.1', port))
                     sock.close()
                     if result == 0:
-                        # Port is open - verify it's actually a working HTTP proxy
+                        # Port is open - verify it's actually a working proxy
                         try:
                             proxy = f"http://127.0.0.1:{port}"
                             r = requests.get(
-                                "https://ifconfig.me/ip",
+                                "http://ifconfig.me/ip",
                                 proxies={"http": proxy, "https": proxy},
-                                timeout=15
+                                timeout=10
                             )
-                            if r.status_code == 200:
+                            if r.status_code == 200 and len(r.text.strip()) > 0:
                                 self.proxy_port = port
                                 self.proxy_url = proxy
                                 self.current_ip = r.text.strip()
-                                self._log(f"  Psiphon tunnel established!")
-                                self._log(f"  Psiphon HTTP proxy on port {port}")
-                                self._log(f"  Psiphon ready -> IP: {self.current_ip}")
+                                self._log(f"  Psiphon tunnel established! ({elapsed}s)")
+                                self._log(f"  Proxy: 127.0.0.1:{port}")
+                                self._log(f"  Psiphon IP: {self.current_ip}")
                                 self._tunnel_connected.set()
                                 return True
                         except requests.exceptions.ProxyError:
-                            # Proxy port is open but tunnel not ready yet
+                            # Port open but tunnel not fully ready yet
+                            if elapsed > 10:
+                                self._log(f"  Port {port} open, tunnel connecting... ({elapsed}s)")
+                        except requests.exceptions.ConnectionError:
                             pass
                         except Exception:
                             pass
                 except Exception:
                     pass
 
-            time.sleep(3)
+            time.sleep(poll_interval)
+
+        # Last resort: try netstat-based detection
+        self._log("  Fixed port detection failed, scanning all ports...")
+        detected_port = self._detect_proxy_port()
+        if detected_port:
+            proxy = f"http://127.0.0.1:{detected_port}"
+            try:
+                r = requests.get("http://ifconfig.me/ip",
+                                 proxies={"http": proxy, "https": proxy},
+                                 timeout=10)
+                if r.status_code == 200:
+                    self.proxy_port = detected_port
+                    self.proxy_url = proxy
+                    self.current_ip = r.text.strip()
+                    self._log(f"  Psiphon tunnel established via port scan!")
+                    self._log(f"  Proxy: 127.0.0.1:{detected_port}")
+                    self._log(f"  Psiphon IP: {self.current_ip}")
+                    self._tunnel_connected.set()
+                    return True
+            except Exception:
+                pass
 
         self._log(f"  Psiphon tunnel did not connect within {timeout}s")
         return False
@@ -606,11 +711,14 @@ class PsiphonManager:
     def start(self, port=8080):
         """Start Psiphon3.exe (full Windows app). Auto-downloads if needed.
 
-        Psiphon3.exe auto-connects on launch and creates a local HTTP proxy.
-        Default HTTP proxy port is 8080 (we auto-detect the actual port).
+        Pre-configures Windows registry for silent operation:
+        - Suppresses browser opening
+        - Suppresses system proxy changes
+        - Sets fixed proxy ports (HTTP=8080, SOCKS=1080)
+        - Enables systray minimize
 
-        Args:
-            port: Hint for expected HTTP proxy port (default 8080).
+        Then launches Psiphon3.exe with hidden window and waits for the
+        HTTP proxy to become available on port 8080.
         """
         if not self.psiphon_path:
             self._log("Psiphon3.exe not found, attempting auto-download...")
@@ -623,17 +731,21 @@ class PsiphonManager:
             self._tunnel_connected.clear()
             self.proxy_port = 0
 
-            self._log(f"Starting Psiphon3.exe (full Windows client)...")
+            # Configure registry BEFORE launching Psiphon3.exe
+            # This sets silent mode + fixed proxy ports
+            self._configure_registry()
+
+            self._log(f"Starting Psiphon3.exe (silent mode)...")
             try:
-                # Launch Psiphon3.exe - it's a GUI app that auto-connects
-                # SW_SHOWMINIMIZED via startupinfo to minimize the window
+                # Launch Psiphon3.exe with hidden window
+                # SW_HIDE (0) = completely hidden, no taskbar entry
                 startupinfo = None
                 creationflags = 0
                 if hasattr(subprocess, 'STARTUPINFO'):
                     startupinfo = subprocess.STARTUPINFO()
                     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = 6  # SW_MINIMIZE
-                if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                    startupinfo.wShowWindow = 0  # SW_HIDE
+                if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP'):
                     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
                 self.process = subprocess.Popen(
@@ -641,12 +753,14 @@ class PsiphonManager:
                     startupinfo=startupinfo,
                     creationflags=creationflags,
                 )
+                self._log(f"  Psiphon3.exe launched (PID: {self.process.pid})")
             except Exception as e:
                 self._log(f"  Failed to start Psiphon3.exe: {e}")
                 return False
 
             # Wait for the tunnel to establish and proxy to become available
-            connected = self._wait_for_proxy(timeout=120)
+            # Reduced from 120s since Psiphon usually connects in 10-30s
+            connected = self._wait_for_proxy(timeout=60)
 
             if not connected:
                 self.stop()
@@ -663,8 +777,8 @@ class PsiphonManager:
         self._log("Rotating Psiphon IP...")
         old_ip = self.current_ip
         self.stop()
-        time.sleep(5)  # Wait for Psiphon to fully cleanup
-        success = self.start(self.proxy_port or 8080)
+        time.sleep(3)  # Wait for Psiphon to fully cleanup
+        success = self.start()
         if success:
             self._log(f"Psiphon rotated: {old_ip} -> {self.current_ip}")
         return success
