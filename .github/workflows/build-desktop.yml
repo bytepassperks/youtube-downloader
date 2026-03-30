@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master, 'devin/*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r desktop/requirements.txt
+
+      - name: Build MegaTransfer EXE
+        working-directory: desktop
+        run: |
+          pyinstaller --onefile --windowed --name MegaTransfer --clean --noconfirm mega_transfer.py
+
+      - name: Build MegaUploader EXE
+        working-directory: desktop
+        run: |
+          pyinstaller --onefile --windowed --name MegaUploader --clean --noconfirm mega_uploader.py
+
+      - name: Upload MegaTransfer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MegaTransfer-Windows
+          path: desktop/dist/MegaTransfer.exe
+          retention-days: 90
+
+      - name: Upload MegaUploader artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MegaUploader-Windows
+          path: desktop/dist/MegaUploader.exe
+          retention-days: 90

@@ -1,0 +1,5 @@
+customtkinter>=5.2.0
+requests>=2.31.0
+pycryptodome>=3.19.0
+boto3>=1.34.0
+pyinstaller>=6.0.0
