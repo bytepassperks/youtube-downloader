@@ -108,6 +108,13 @@ async def start_job(job_id: int, admin: dict = Depends(get_admin_user)):
 @router.delete("/{job_id}")
 async def delete_job(job_id: int, admin: dict = Depends(get_admin_user)):
     conn = get_connection()
+    job = conn.execute("SELECT status FROM transfer_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] in ("downloading", "uploading"):
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"Cannot delete active job (status: {job['status']}). Stop it first.")
     conn.execute("DELETE FROM content_items WHERE job_id = ?", (job_id,))
     conn.execute("DELETE FROM allowed_access WHERE job_id = ?", (job_id,))
     conn.execute("DELETE FROM download_logs WHERE job_id = ?", (job_id,))
@@ -124,6 +131,9 @@ async def retry_job(job_id: int, admin: dict = Depends(get_admin_user)):
     if not job:
         conn.close()
         raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] in ("downloading", "uploading"):
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"Cannot retry active job (status: {job['status']}). Stop it first.")
 
     conn.execute(
         """UPDATE transfer_jobs

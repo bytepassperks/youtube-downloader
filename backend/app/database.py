@@ -105,16 +105,19 @@ def init_db():
     conn.commit()
 
     # Migrate existing databases: add new columns if missing
-    try:
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(transfer_jobs)").fetchall()]
-        for col, default in [
-            ("current_file", "''"), ("download_speed", "''"),
-            ("upload_speed", "''"), ("downloaded_files", "0"),
-        ]:
-            if col not in cols:
-                conn.execute(f"ALTER TABLE transfer_jobs ADD COLUMN {col} TEXT DEFAULT {default}")
-        conn.commit()
-    except Exception:
-        pass
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(transfer_jobs)").fetchall()]
+    for col, col_type, default in [
+        ("current_file", "TEXT", "''"),
+        ("download_speed", "TEXT", "''"),
+        ("upload_speed", "TEXT", "''"),
+        ("downloaded_files", "INTEGER", "0"),
+    ]:
+        if col not in cols:
+            alter_sql = f"ALTER TABLE transfer_jobs ADD COLUMN {col} {col_type} DEFAULT {default}"
+            try:
+                conn.execute(alter_sql)
+            except Exception as e:
+                print(f"[DB Migration] Failed: {alter_sql} — {e}")
+    conn.commit()
 
     conn.close()

@@ -197,20 +197,37 @@ def _run_transfer(job_id: int):
         sys.stdout.flush()
 
 
+_ALLOWED_JOB_COLUMNS = {
+    "status", "progress", "updated_at", "total_files", "uploaded_files",
+    "folder_path", "download_slug", "error_message", "current_file",
+    "download_speed", "upload_speed", "downloaded_files", "completed_at",
+    "telegram_sent",
+}
+
+
 def _update_job(job_id: int, **kwargs):
     """Update job fields in database."""
     if not kwargs:
         return
+    # Filter to only allowed column names to prevent SQL injection
+    safe_kwargs = {k: v for k, v in kwargs.items() if k in _ALLOWED_JOB_COLUMNS}
+    if not safe_kwargs:
+        return
     conn = get_connection()
-    sets = ", ".join(f"{k} = ?" for k in kwargs)
-    values = list(kwargs.values()) + [job_id]
-    conn.execute(f"UPDATE transfer_jobs SET {sets} WHERE id = ?", values)
-    conn.commit()
-    conn.close()
+    sets = ", ".join(f"{k} = ?" for k in safe_kwargs)
+    values = list(safe_kwargs.values()) + [job_id]
+    try:
+        conn.execute(f"UPDATE transfer_jobs SET {sets} WHERE id = ?", values)
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] Failed to update job {job_id}: {e}")
+        sys.stdout.flush()
+    finally:
+        conn.close()
 
 
 def _count_files(path: str) -> int:
     count = 0
-    for root, dirs, files in os.walk(path):
+    for _root, _dirs, files in os.walk(path):
         count += len(files)
     return count

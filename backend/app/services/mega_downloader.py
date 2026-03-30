@@ -54,7 +54,10 @@ RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
 # --- Mega Crypto Helpers ------------------------------------------------
 
 def _b64_decode(data: str) -> bytes:
-    pad = (4 - len(data) % 4) % 4
+    remainder = len(data) % 4
+    if remainder == 1:
+        raise ValueError(f"Invalid base64 length (mod 4 == 1): {len(data)}")
+    pad = (-len(data)) % 4
     data += '=' * pad
     return base64.urlsafe_b64decode(data)
 
@@ -187,11 +190,15 @@ def _list_folder_files(folder_id: str, folder_key: tuple) -> list:
             root_handle = h
             break
 
+    def _sanitize_name(name: str) -> str:
+        """Strip path separators and null bytes to prevent path traversal."""
+        return os.path.basename(name.replace('\0', '').replace('/', '_').replace('\\', '_'))
+
     def get_path(h):
         parts = []
         current = h
         while current and current != root_handle and current in nodes:
-            parts.append(nodes[current]['name'])
+            parts.append(_sanitize_name(nodes[current]['name']))
             current = nodes[current]['parent']
         parts.reverse()
         return '/'.join(parts)
@@ -585,25 +592,35 @@ class TorManager:
         """Get new Tor circuit (new exit IP) via control port."""
         import socket
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect(('127.0.0.1', self.control_port))
-            s.send(b'AUTHENTICATE ""\r\n')
-            resp = s.recv(256)
-            if b'250' not in resp:
-                # Try without password
-                s.close()
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('127.0.0.1', self.control_port))
+                s.send(b'AUTHENTICATE ""\r\n')
+                resp = s.recv(256)
+                if b'250' not in resp:
+                    # Try without password in a new socket
+                    pass
+                else:
+                    s.send(b'SIGNAL NEWNYM\r\n')
+                    resp = s.recv(256)
+                    if b'250' in resp:
+                        print("[Tor] New circuit requested (new IP in ~5s)")
+                        sys.stdout.flush()
+                        time.sleep(5)
+                        return True
+                    print(f"[Tor] NEWNYM failed: {resp}")
+                    return False
+            # Retry without password
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(('127.0.0.1', self.control_port))
                 s.send(b'AUTHENTICATE\r\n')
                 resp = s.recv(256)
-            s.send(b'SIGNAL NEWNYM\r\n')
-            resp = s.recv(256)
-            s.close()
-            if b'250' in resp:
-                print(f"[Tor] New circuit requested (new IP in ~5s)")
-                sys.stdout.flush()
-                time.sleep(5)  # Wait for new circuit
-                return True
+                s.send(b'SIGNAL NEWNYM\r\n')
+                resp = s.recv(256)
+                if b'250' in resp:
+                    print("[Tor] New circuit requested (new IP in ~5s)")
+                    sys.stdout.flush()
+                    time.sleep(5)
+                    return True
             print(f"[Tor] NEWNYM failed: {resp}")
             return False
         except Exception as e:
@@ -2233,23 +2250,35 @@ class MegaDownloader:
             attempts += 1
         return False
 
+    _ALLOWED_JOB_COLUMNS = {
+        "status", "progress", "updated_at", "total_files", "uploaded_files",
+        "folder_path", "download_slug", "error_message", "current_file",
+        "download_speed", "upload_speed", "downloaded_files", "completed_at",
+        "telegram_sent",
+    }
+
     def _update_job_status(self, job_id: int, **kwargs):
         if not kwargs:
             return
+        # Filter to only allowed column names to prevent SQL injection
+        safe_kwargs = {k: v for k, v in kwargs.items() if k in self._ALLOWED_JOB_COLUMNS}
+        if not safe_kwargs:
+            return
         conn = get_connection()
-        sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [job_id]
+        sets = ", ".join(f"{k} = ?" for k in safe_kwargs)
+        values = list(safe_kwargs.values()) + [job_id]
         try:
             conn.execute(f"UPDATE transfer_jobs SET {sets} WHERE id = ?", values)
             conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DB] Failed to update job {job_id}: {e}")
+            sys.stdout.flush()
         finally:
             conn.close()
 
     def _count_files(self, path: str) -> int:
         count = 0
-        for root, dirs, files in os.walk(path):
+        for _root, _dirs, files in os.walk(path):
             count += sum(1 for f in files if not f.startswith('.'))
         return count
 

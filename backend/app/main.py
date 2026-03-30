@@ -1,10 +1,10 @@
 import os
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db, get_connection
-from app.utils.auth import get_password_hash
+from app.utils.auth import get_password_hash, get_admin_user
 from app.config import settings as app_settings
 from app.routes import auth, jobs, members, portal
 from app.routes import settings as settings_route
@@ -122,8 +122,8 @@ async def healthz():
 
 
 @app.get("/api/test-psiphon")
-async def test_psiphon():
-    """Test if Psiphon can connect on this server."""
+async def test_psiphon(admin: dict = Depends(get_admin_user)):
+    """Test if Psiphon can connect on this server. Requires admin auth."""
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
 

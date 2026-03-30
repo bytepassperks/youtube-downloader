@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 from datetime import datetime
 
 
@@ -32,7 +32,7 @@ class JobCreate(BaseModel):
     title: str
     mega_link: str
     exclude_files: Union[str, list[str]] = []
-    storage_target: str = "idrive"  # "idrive" or "b2"
+    storage_target: Literal["idrive", "b2"] = "idrive"
 
     @field_validator("exclude_files", mode="before")
     @classmethod
