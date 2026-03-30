@@ -525,7 +525,7 @@ class PsiphonManager:
     def _configure_registry(self):
         """Pre-configure Psiphon3 Windows registry to run silently.
 
-        Sets registry values under HKCU\Software\Psiphon3 to:
+        Sets registry values under HKCU\\Software\\Psiphon3 to:
         - UserSkipBrowser=1: Don't open browser on connect
         - UserSkipProxySettings=1: Don't change system proxy settings
         - SystrayMinimize=1: Minimize to system tray
