@@ -20,6 +20,17 @@ UPLOAD_WORKERS = 4
 # Global lock to prevent concurrent downloads
 _transfer_lock = threading.Lock()
 _current_job_id: Optional[int] = None
+_cancel_event = threading.Event()  # Set to cancel the running job
+
+
+def is_job_cancelled() -> bool:
+    """Check if the current job has been cancelled."""
+    return _cancel_event.is_set()
+
+
+def cancel_current_job():
+    """Signal the running job to stop."""
+    _cancel_event.set()
 
 
 def slugify(text: str) -> str:
@@ -93,6 +104,7 @@ def _run_transfer(job_id: int):
         return
 
     _current_job_id = job_id
+    _cancel_event.clear()  # Reset cancel flag for new job
     print(f"[Job {job_id}] Acquired transfer lock")
     sys.stdout.flush()
 
@@ -101,6 +113,14 @@ def _run_transfer(job_id: int):
     conn.close()
 
     if not job:
+        _transfer_lock.release()
+        _current_job_id = None
+        return
+
+    # Skip if job was already stopped/failed
+    if job["status"] in ("failed", "completed"):
+        print(f"[Job {job_id}] Job already {job['status']}, skipping")
+        sys.stdout.flush()
         _transfer_lock.release()
         _current_job_id = None
         return

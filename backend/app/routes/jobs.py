@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from app.models.schemas import JobCreate, JobResponse
 from app.utils.auth import get_admin_user
 from app.database import get_connection
-from app.services.transfer_worker import slugify, process_transfer_job
+from app.services.transfer_worker import slugify, process_transfer_job, cancel_current_job
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -112,7 +112,7 @@ async def stop_job(job_id: int, admin: dict = Depends(get_admin_user)):
     if not job:
         conn.close()
         raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] not in ("downloading", "uploading"):
+    if job["status"] not in ("downloading", "uploading", "queued"):
         conn.close()
         raise HTTPException(status_code=400, detail=f"Job is not active (status: {job['status']})")
     conn.execute(
@@ -121,6 +121,8 @@ async def stop_job(job_id: int, admin: dict = Depends(get_admin_user)):
     )
     conn.commit()
     conn.close()
+    # Signal the background thread to stop
+    cancel_current_job()
     return {"message": "Job stopped", "job_id": job_id}
 
 
