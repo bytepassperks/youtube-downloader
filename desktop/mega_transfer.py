@@ -1729,7 +1729,7 @@ class MegaTransferApp:
     def _save_settings(self):
         """Save settings from UI entries."""
         int_fields = {'parallel_threads', 'chunk_size_mb', 'max_retries',
-                      'large_file_threshold_mb', 'small_file_threshold_mb'}
+                      'small_file_threshold_mb'}
         for key, entry in self.setting_entries.items():
             val = entry.get().strip()
             if key in int_fields:
@@ -1981,7 +1981,7 @@ def cli_mode():
     parser.add_argument("mega_url", help="Mega folder URL")
     parser.add_argument("title", help="Job title")
     parser.add_argument("--prefix", help="S3 prefix (auto-generated from title if not provided)")
-    parser.add_argument("--threads", type=int, default=8, help="Parallel threads per file")
+    parser.add_argument("--threads", type=int, default=16, help="Parallel threads per file")
     parser.add_argument("--no-psiphon", action="store_true", help="Disable Psiphon")
     args = parser.parse_args()
 
