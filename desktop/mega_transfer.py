@@ -88,7 +88,6 @@ DEFAULT_SETTINGS = {
     "psiphon_rotate_on_quota": True,
     "chunk_size_mb": 8,
     "max_retries": 10,
-    "large_file_threshold_mb": 400,
     "small_file_threshold_mb": 20,
 }
 
@@ -351,17 +350,33 @@ class MegaAPI:
 # ============================================================================
 # PSIPHON MANAGER
 # ============================================================================
-class PsiphonManager:
-    """Manages Psiphon tunnel for IP rotation."""
+# Psiphon tunnel core binary download URLs (official Psiphon-Labs repo)
+PSIPHON_MIRRORS = [
+    "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/windows/psiphon-tunnel-core-i686.exe",
+]
 
-    def __init__(self):
+
+class PsiphonManager:
+    """Manages Psiphon tunnel for IP rotation with auto-download."""
+
+    def __init__(self, log_callback=None):
         self.process = None
         self.proxy_port = 0
         self.proxy_url = None
         self.current_ip = None
         self._lock = threading.Lock()
+        self._log_callback = log_callback
         self.psiphon_path = self._find_psiphon()
         self.config_path = os.path.join(SETTINGS_DIR, "psiphon_config.json")
+
+    def _log(self, msg):
+        """Log message to logger and optional UI callback."""
+        logger.info(msg)
+        if self._log_callback:
+            try:
+                self._log_callback(msg)
+            except Exception:
+                pass
 
     def _find_psiphon(self):
         """Find psiphon-tunnel-core binary."""
@@ -377,8 +392,64 @@ class PsiphonManager:
                 logger.info(f"Found Psiphon at: {c}")
                 return c
 
-        logger.warning("Psiphon binary not found. IP rotation will not be available.")
+        logger.warning("Psiphon binary not found locally.")
         return None
+
+    def download_psiphon(self):
+        """Auto-download psiphon-tunnel-core.exe if not found."""
+        dest = os.path.join(SETTINGS_DIR, "psiphon-tunnel-core.exe")
+        if os.path.exists(dest):
+            file_size = os.path.getsize(dest)
+            if file_size > 5_000_000:  # Valid binary should be >5MB
+                self.psiphon_path = dest
+                self._log(f"Psiphon already downloaded ({file_size/1024/1024:.1f} MB)")
+                return True
+            else:
+                # Corrupted/incomplete download, remove and re-download
+                os.remove(dest)
+
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        self._log("Downloading Psiphon tunnel core (~22 MB)...")
+
+        for url in PSIPHON_MIRRORS:
+            try:
+                self._log(f"  Trying: {url.split('/')[-1]} from {url.split('/')[2]}")
+                resp = requests.get(url, timeout=120, stream=True)
+                if resp.status_code != 200:
+                    self._log(f"  HTTP {resp.status_code}, trying next mirror...")
+                    continue
+
+                total = int(resp.headers.get('content-length', 0))
+                downloaded = 0
+                tmp_path = dest + ".tmp"
+                with open(tmp_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = downloaded * 100 // total
+                            self._log(f"  Downloading Psiphon: {pct}% ({downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB)")
+
+                # Verify size
+                if os.path.getsize(tmp_path) < 5_000_000:
+                    self._log("  Download too small, trying next mirror...")
+                    os.remove(tmp_path)
+                    continue
+
+                os.rename(tmp_path, dest)
+                self.psiphon_path = dest
+                self._log(f"Psiphon downloaded successfully ({os.path.getsize(dest)/1024/1024:.1f} MB)")
+                return True
+
+            except Exception as e:
+                self._log(f"  Download failed: {e}")
+                if os.path.exists(dest + ".tmp"):
+                    os.remove(dest + ".tmp")
+                continue
+
+        self._log("[WARN] Could not download Psiphon. IP rotation will not be available.")
+        self._log("[WARN] Downloads will work but limited to ~5 MB/s per IP without rotation.")
+        return False
 
     def _write_config(self, port):
         """Write Psiphon config file."""
@@ -396,17 +467,19 @@ class PsiphonManager:
         return self.config_path
 
     def start(self, port=58080):
-        """Start Psiphon tunnel."""
+        """Start Psiphon tunnel. Auto-downloads binary if needed."""
         if not self.psiphon_path:
-            logger.warning("Psiphon binary not available, skipping")
-            return False
+            self._log("Psiphon binary not found, attempting auto-download...")
+            if not self.download_psiphon():
+                self._log("Psiphon not available, using direct connection")
+                return False
 
         with self._lock:
             self.stop()  # Kill any existing
             self.proxy_port = port
             config = self._write_config(port)
 
-            logger.info(f"Starting Psiphon on port {port}...")
+            self._log(f"Starting Psiphon on port {port}...")
             try:
                 self.process = subprocess.Popen(
                     [self.psiphon_path, "-config", config],
@@ -1253,10 +1326,12 @@ class MegaTransferApp:
     def __init__(self):
         _init_gui()  # Initialize GUI modules
         self.settings = load_settings()
-        self.psiphon = PsiphonManager()
+        self.psiphon = PsiphonManager()  # log_callback set after UI is built
         self.engine = None
         self.job_thread = None
         self._build_ui()
+        # Now that UI is built, wire up Psiphon log callback
+        self.psiphon._log_callback = self._log_to_ui
 
     def _build_ui(self):
         """Build the main UI."""
@@ -1558,7 +1633,6 @@ class MegaTransferApp:
             ("parallel_threads", "Parallel Threads (per file)"),
             ("chunk_size_mb", "Chunk Size (MB)"),
             ("max_retries", "Max Retries"),
-            ("large_file_threshold_mb", "Large File Threshold (MB)"),
             ("small_file_threshold_mb", "Small File Threshold (MB)"),
         ]
         for key, label in num_fields:
