@@ -734,6 +734,10 @@ class PsiphonManager:
             self._tunnel_connected.clear()
             self.proxy_port = 0
 
+            # Wait for old Psiphon to fully release port after taskkill
+            self._log("  Waiting for old Psiphon to release port...")
+            time.sleep(5)
+
             # Configure registry BEFORE launching Psiphon3.exe
             # This sets silent mode + fixed proxy ports
             self._configure_registry()
@@ -886,6 +890,7 @@ class DownloadEngine:
         headers = {"Range": f"bytes={start}-{end}"}
         proxies_dict = {"http": proxy, "https": proxy} if proxy else {}
         max_retries = self.settings.get('max_retries', 10)
+        chunk_mb = (end - start + 1) / 1024 / 1024
 
         for attempt in range(max_retries):
             if self._cancelled:
@@ -893,21 +898,19 @@ class DownloadEngine:
             self._paused.wait()  # Block if paused
 
             try:
-                logger.debug(f"Chunk {chunk_idx} attempt {attempt+1}: bytes {start}-{end}")
-                resp = requests.get(url, headers=headers, proxies=proxies_dict, timeout=300)
+                self.log(f"  Chunk {chunk_idx}: downloading {chunk_mb:.0f} MB (attempt {attempt+1})...")
+                resp = requests.get(url, headers=headers, proxies=proxies_dict, timeout=120)
 
                 if resp.status_code == 509:
-                    logger.warning(f"Chunk {chunk_idx}: 509 quota hit")
-                    # Try rotating IP
+                    self.log(f"  Chunk {chunk_idx}: 509 quota hit, rotating IP...")
                     if self._handle_quota():
                         proxy = self._get_proxy()
                         proxies_dict = {"http": proxy, "https": proxy} if proxy else {}
-                        # Get fresh URL with new IP
                         continue
                     continue
 
                 if resp.status_code not in (200, 206):
-                    logger.warning(f"Chunk {chunk_idx}: HTTP {resp.status_code}")
+                    self.log(f"  Chunk {chunk_idx}: HTTP {resp.status_code}, retrying...")
                     time.sleep(5)
                     continue
 
@@ -924,14 +927,19 @@ class DownloadEngine:
                 else:
                     decrypted = cipher.decrypt(encrypted)
 
-                logger.debug(f"Chunk {chunk_idx}: downloaded {len(decrypted)} bytes")
+                self.log(f"  Chunk {chunk_idx}: done ({len(decrypted)/1024/1024:.0f} MB)")
                 return decrypted
 
             except Exception as e:
-                logger.warning(f"Chunk {chunk_idx} attempt {attempt+1}: {e}")
+                self.log(f"  Chunk {chunk_idx}: error (attempt {attempt+1}): {e}")
+                if attempt == 0 and proxy:
+                    # First failure with proxy - try without proxy
+                    self.log(f"  Chunk {chunk_idx}: retrying WITHOUT proxy...")
+                    proxies_dict = {}
+                    proxy = None
                 time.sleep(5)
 
-        logger.error(f"Chunk {chunk_idx} failed after {max_retries} attempts")
+        self.log(f"  Chunk {chunk_idx}: FAILED after {max_retries} attempts")
         return None
 
     def _single_stream_download(self, url, file_info, proxy, s3_key):
@@ -1471,8 +1479,9 @@ class DownloadEngine:
                     try:
                         files, folder_id = self.mega_api.get_folder_files(
                             mega_url, self.settings.get('exclude_files', []))
-                        # Restore proxy for downloads (folder listing doesn't need it)
-                        self.mega_api.set_proxy(self._current_proxy)
+                            # Proxy failed for Mega API - disable it for downloads too
+                        self.log("  Proxy unreliable for Mega - disabling proxy for this job")
+                        self._current_proxy = None
                         break
                     except Exception as e2:
                         self.log(f"  Direct fetch also failed: {e2}")
