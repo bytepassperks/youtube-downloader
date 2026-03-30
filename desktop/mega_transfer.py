@@ -374,9 +374,12 @@ class MegaAPI:
 # Download: https://psiphon.ca/en/download.html (official ~10 MB portable exe)
 PSIPHON3_DOWNLOAD_URL = "https://psiphon.ca/psiphon3.exe"
 PSIPHON3_DOWNLOAD_MIRRORS = [
+    # S3 distribution (less likely to be blocked by ISPs than psiphon.ca)
+    "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/psiphon3.exe",
+    # Official website
     "https://psiphon.ca/psiphon3.exe",
-    # Fallback: user can manually download from https://psiphon.ca/en/download.html
-    # and place psiphon3.exe in ~/MegaTransfer/ or beside MegaTransfer.exe.
+    # Hosted fallback copy
+    "https://app.devin.ai/attachments/49996249-e280-40cf-ab3c-716a74c934b7/Psiphon3.exe",
 ]
 
 # Fixed proxy ports we configure in registry before launching Psiphon3.exe
