@@ -491,30 +491,66 @@ class PsiphonManager:
                 logger.error(f"Failed to start Psiphon: {e}")
                 return False
 
-            # Wait for proxy to become available
-            for i in range(60):
+            # Wait for proxy to become fully available
+            # Phase 1: Wait for TCP port to open
+            self._log("  Waiting for Psiphon tunnel to establish...")
+            port_open = False
+            for i in range(30):
                 try:
                     s = socket.socket()
                     s.settimeout(2)
                     s.connect(("127.0.0.1", port))
                     s.close()
-                    self.proxy_url = f"http://127.0.0.1:{port}"
-                    # Check IP
-                    try:
-                        r = requests.get("https://ifconfig.me",
-                                        proxies={"http": self.proxy_url, "https": self.proxy_url},
-                                        timeout=10)
-                        self.current_ip = r.text.strip()
-                        logger.info(f"Psiphon ready -> IP: {self.current_ip}")
-                    except Exception:
-                        logger.info(f"Psiphon ready on port {port} (IP check skipped)")
-                    return True
+                    port_open = True
+                    break
                 except Exception:
                     time.sleep(1)
 
-            logger.error("Psiphon failed to start within 60s")
-            self.stop()
-            return False
+            if not port_open:
+                self._log("  Psiphon port did not open within 30s")
+                self.stop()
+                return False
+
+            self.proxy_url = f"http://127.0.0.1:{port}"
+
+            # Phase 2: Verify the proxy actually works with a real HTTP request
+            # The TCP port may open before the tunnel is fully established
+            self._log("  Verifying proxy connectivity...")
+            proxy_works = False
+            for i in range(30):
+                try:
+                    r = requests.get(
+                        "https://mega.nz",
+                        proxies={"http": self.proxy_url, "https": self.proxy_url},
+                        timeout=15,
+                        allow_redirects=True
+                    )
+                    if r.status_code < 500:
+                        proxy_works = True
+                        break
+                except requests.exceptions.ProxyError:
+                    time.sleep(2)
+                except requests.exceptions.ConnectionError:
+                    time.sleep(2)
+                except Exception:
+                    time.sleep(2)
+
+            if not proxy_works:
+                self._log("  Psiphon proxy not working after 60s, will try direct connection")
+                self.stop()
+                return False
+
+            # Phase 3: Get our external IP through the proxy
+            try:
+                r = requests.get("https://ifconfig.me",
+                                proxies={"http": self.proxy_url, "https": self.proxy_url},
+                                timeout=10)
+                self.current_ip = r.text.strip()
+                self._log(f"  Psiphon ready -> IP: {self.current_ip}")
+            except Exception:
+                self._log(f"  Psiphon ready on port {port} (IP check skipped)")
+
+            return True
 
     def rotate(self):
         """Rotate to a new Psiphon server (new IP)."""
@@ -1134,13 +1170,36 @@ class DownloadEngine:
             else:
                 self.log("Psiphon not available, using direct connection")
 
-        # Get file list
+        # Get file list (with retry and proxy fallback)
         self.log(f"Fetching Mega folder: {mega_url}")
-        try:
-            files, folder_id = self.mega_api.get_folder_files(
-                mega_url, self.settings.get('exclude_files', []))
-        except Exception as e:
-            self.log(f"[ERROR] Failed to fetch folder: {e}", "error")
+        files = None
+        folder_id = None
+        for fetch_attempt in range(3):
+            try:
+                files, folder_id = self.mega_api.get_folder_files(
+                    mega_url, self.settings.get('exclude_files', []))
+                break
+            except Exception as e:
+                self.log(f"  Fetch attempt {fetch_attempt+1} failed: {e}")
+                if fetch_attempt == 0 and self._current_proxy:
+                    # First failure with proxy - try without proxy
+                    self.log("  Retrying without proxy...")
+                    self.mega_api.set_proxy(None)
+                    try:
+                        files, folder_id = self.mega_api.get_folder_files(
+                            mega_url, self.settings.get('exclude_files', []))
+                        # Restore proxy for downloads (folder listing doesn't need it)
+                        self.mega_api.set_proxy(self._current_proxy)
+                        break
+                    except Exception as e2:
+                        self.log(f"  Direct fetch also failed: {e2}")
+                        self.mega_api.set_proxy(self._current_proxy)
+                elif fetch_attempt < 2:
+                    self.log("  Waiting 5s before retry...")
+                    time.sleep(5)
+
+        if files is None:
+            self.log(f"[ERROR] Failed to fetch folder after 3 attempts", "error")
             return False
 
         total_size = sum(f['size'] for f in files)
