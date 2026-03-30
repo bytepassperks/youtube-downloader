@@ -21,14 +21,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r desktop/requirements.txt
 
-      - name: Build EXE with PyInstaller
+      - name: Build MegaTransfer EXE
         working-directory: desktop
         run: |
           pyinstaller --onefile --windowed --name MegaTransfer --clean --noconfirm mega_transfer.py
 
-      - name: Upload artifact
+      - name: Build MegaUploader EXE
+        working-directory: desktop
+        run: |
+          pyinstaller --onefile --windowed --name MegaUploader --clean --noconfirm mega_uploader.py
+
+      - name: Upload MegaTransfer artifact
         uses: actions/upload-artifact@v4
         with:
           name: MegaTransfer-Windows
           path: desktop/dist/MegaTransfer.exe
+          retention-days: 90
+
+      - name: Upload MegaUploader artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MegaUploader-Windows
+          path: desktop/dist/MegaUploader.exe
           retention-days: 90
