@@ -628,17 +628,23 @@ class PsiphonManager:
         Psiphon3.exe auto-connects on launch. We poll the fixed HTTP proxy port
         (8080, set via registry) until it responds, indicating tunnel is up.
 
+        IMPORTANT: We require the tunnel to take at least 5 seconds to establish.
+        If it connects instantly (0s), we're detecting a stale proxy from an old
+        Psiphon instance, not our newly launched one.
+
         Args:
             timeout: Maximum seconds to wait for proxy to become available.
         """
-        import socket
         start_time = time.time()
         # We configured port 8080 in registry; also check a few fallbacks
         primary_port = PSIPHON_HTTP_PROXY_PORT
         fallback_ports = [8081, 8090, 8888, 58080]
         poll_interval = 2  # seconds between checks
+        min_connect_time = 5  # Minimum seconds before accepting connection
+                               # A real tunnel takes 10-30s; 0s = stale proxy
 
         self._log(f"  Waiting for Psiphon tunnel (port {primary_port}, up to {timeout}s)...")
+        self._log(f"  (will ignore connections in first {min_connect_time}s to avoid stale proxy)")
 
         while time.time() - start_time < timeout:
             # Check if process is still running
@@ -647,6 +653,11 @@ class PsiphonManager:
                 return False
 
             elapsed = int(time.time() - start_time)
+
+            # Skip checking in the first few seconds to avoid stale proxy detection
+            if elapsed < min_connect_time:
+                time.sleep(poll_interval)
+                continue
 
             # Check primary port first, then fallbacks
             ports_to_check = [primary_port] + fallback_ports
@@ -658,6 +669,7 @@ class PsiphonManager:
                     sock.close()
                     if result == 0:
                         # Port is open - verify it's actually a working proxy
+                        # Test with a real HTTPS request through the proxy
                         try:
                             proxy = f"http://127.0.0.1:{port}"
                             r = requests.get(
@@ -666,14 +678,26 @@ class PsiphonManager:
                                 timeout=10
                             )
                             if r.status_code == 200 and len(r.text.strip()) > 0:
-                                self.proxy_port = port
-                                self.proxy_url = proxy
-                                self.current_ip = r.text.strip()
-                                self._log(f"  Psiphon tunnel established! ({elapsed}s)")
-                                self._log(f"  Proxy: 127.0.0.1:{port}")
-                                self._log(f"  Psiphon IP: {self.current_ip}")
-                                self._tunnel_connected.set()
-                                return True
+                                # Also verify the proxy works for HTTPS (Mega uses HTTPS)
+                                try:
+                                    r2 = requests.get(
+                                        "https://mega.nz",
+                                        proxies={"http": proxy, "https": proxy},
+                                        timeout=15
+                                    )
+                                    if r2.status_code in (200, 301, 302, 403):
+                                        self.proxy_port = port
+                                        self.proxy_url = proxy
+                                        self.current_ip = r.text.strip()
+                                        self._log(f"  Psiphon tunnel established! ({elapsed}s)")
+                                        self._log(f"  Proxy: 127.0.0.1:{port}")
+                                        self._log(f"  Psiphon IP: {self.current_ip}")
+                                        self._log(f"  HTTPS verified (mega.nz: {r2.status_code})")
+                                        self._tunnel_connected.set()
+                                        return True
+                                except Exception as e2:
+                                    self._log(f"  Port {port} HTTP works but HTTPS failed: {e2}")
+                                    self._log(f"  Continuing to wait for full tunnel...")
                         except requests.exceptions.ProxyError:
                             # Port open but tunnel not fully ready yet
                             if elapsed > 10:
@@ -735,8 +759,37 @@ class PsiphonManager:
             self.proxy_port = 0
 
             # Wait for old Psiphon to fully release port after taskkill
+            # Must verify port 8080 is actually CLOSED before starting new instance
             self._log("  Waiting for old Psiphon to release port...")
-            time.sleep(5)
+            port_wait_start = time.time()
+            max_port_wait = 15  # seconds
+            while time.time() - port_wait_start < max_port_wait:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    result = sock.connect_ex(('127.0.0.1', PSIPHON_HTTP_PROXY_PORT))
+                    sock.close()
+                    if result != 0:
+                        # Port is closed - good!
+                        self._log(f"  Port {PSIPHON_HTTP_PROXY_PORT} is free ({int(time.time()-port_wait_start)}s)")
+                        break
+                    else:
+                        # Port still open - old Psiphon still running
+                        elapsed = int(time.time() - port_wait_start)
+                        self._log(f"  Port {PSIPHON_HTTP_PROXY_PORT} still occupied, waiting... ({elapsed}s)")
+                        # Try killing again
+                        if sys.platform == 'win32' and elapsed > 3:
+                            try:
+                                subprocess.run(["taskkill", "/f", "/im", "psiphon3.exe"],
+                                               capture_output=True, timeout=5)
+                            except Exception:
+                                pass
+                        time.sleep(2)
+                except Exception:
+                    break
+            else:
+                self._log(f"  WARNING: Port {PSIPHON_HTTP_PROXY_PORT} still occupied after {max_port_wait}s")
+                self._log(f"  Will try to start anyway...")
 
             # Configure registry BEFORE launching Psiphon3.exe
             # This sets silent mode + fixed proxy ports
@@ -886,11 +939,12 @@ class DownloadEngine:
         return False
 
     def _download_chunk(self, url, start, end, proxy, key, iv_int, chunk_idx, file_name):
-        """Download a byte range, decrypt it."""
+        """Download a byte range with streaming + stall detection, then decrypt."""
         headers = {"Range": f"bytes={start}-{end}"}
         proxies_dict = {"http": proxy, "https": proxy} if proxy else {}
         max_retries = self.settings.get('max_retries', 10)
         chunk_mb = (end - start + 1) / 1024 / 1024
+        stall_timeout = 30  # seconds with no data = stall
 
         for attempt in range(max_retries):
             if self._cancelled:
@@ -898,8 +952,11 @@ class DownloadEngine:
             self._paused.wait()  # Block if paused
 
             try:
-                self.log(f"  Chunk {chunk_idx}: downloading {chunk_mb:.0f} MB (attempt {attempt+1})...")
-                resp = requests.get(url, headers=headers, proxies=proxies_dict, timeout=120)
+                proxy_label = "via proxy" if proxy else "direct"
+                self.log(f"  Chunk {chunk_idx}: downloading {chunk_mb:.0f} MB ({proxy_label}, attempt {attempt+1})...")
+                # Use stream=True so we can detect stalls (no data for 30s)
+                resp = requests.get(url, headers=headers, proxies=proxies_dict,
+                                    timeout=(15, stall_timeout), stream=True)
 
                 if resp.status_code == 509:
                     self.log(f"  Chunk {chunk_idx}: 509 quota hit, rotating IP...")
@@ -914,7 +971,34 @@ class DownloadEngine:
                     time.sleep(5)
                     continue
 
-                encrypted = resp.content
+                # Stream download with stall detection
+                encrypted_parts = []
+                bytes_received = 0
+                expected = end - start + 1
+                dl_start = time.time()
+                last_data_time = time.time()
+                for data in resp.iter_content(chunk_size=256 * 1024):  # 256KB pieces
+                    if self._cancelled:
+                        return None
+                    encrypted_parts.append(data)
+                    bytes_received += len(data)
+                    last_data_time = time.time()
+                    # Log progress within chunk every 3 seconds
+                    if time.time() - dl_start > 3 and bytes_received < expected:
+                        pct = bytes_received * 100 // expected
+                        speed = bytes_received / (time.time() - dl_start)
+                        if pct % 25 < 5:  # Log at ~25%, 50%, 75%
+                            self.log(f"  Chunk {chunk_idx}: {pct}% ({speed/1024/1024:.1f} MB/s)")
+
+                encrypted = b''.join(encrypted_parts)
+                elapsed = time.time() - dl_start
+                speed = len(encrypted) / elapsed if elapsed > 0 else 0
+
+                if len(encrypted) < expected * 0.9:  # Allow small tolerance
+                    self.log(f"  Chunk {chunk_idx}: incomplete ({len(encrypted)}/{expected} bytes), retrying...")
+                    time.sleep(5)
+                    continue
+
                 # Decrypt
                 block_offset = start // 16
                 counter_start = ((iv_int << 64) + block_offset) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
@@ -927,9 +1011,17 @@ class DownloadEngine:
                 else:
                     decrypted = cipher.decrypt(encrypted)
 
-                self.log(f"  Chunk {chunk_idx}: done ({len(decrypted)/1024/1024:.0f} MB)")
+                self.log(f"  Chunk {chunk_idx}: done ({len(decrypted)/1024/1024:.1f} MB in {elapsed:.0f}s, {speed/1024/1024:.1f} MB/s)")
                 return decrypted
 
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+                self.log(f"  Chunk {chunk_idx}: stall/timeout (attempt {attempt+1}): {type(e).__name__}")
+                if proxy:
+                    # Proxy is likely broken - try without it
+                    self.log(f"  Chunk {chunk_idx}: dropping proxy, retrying direct...")
+                    proxies_dict = {}
+                    proxy = None
+                time.sleep(3)
             except Exception as e:
                 self.log(f"  Chunk {chunk_idx}: error (attempt {attempt+1}): {e}")
                 if attempt == 0 and proxy:
