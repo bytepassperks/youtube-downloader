@@ -493,6 +493,21 @@ class PsiphonManager:
             "TunnelPoolSize": 1,
             "ConnectionWorkerPoolSize": 10,
             "EstablishTunnelTimeoutSeconds": 60,
+            # Restrict to traditional tunnel protocols only.
+            # This prevents the inproxy broker system from initializing,
+            # which requires broker specs we don't have ("no broker specs" error).
+            # These are all the standard non-inproxy protocols from Psiphon source.
+            "LimitTunnelProtocols": [
+                "SSH",
+                "OSSH",
+                "TLS-OSSH",
+                "UNFRONTED-MEEK-OSSH",
+                "UNFRONTED-MEEK-HTTPS-OSSH",
+                "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+                "FRONTED-MEEK-OSSH",
+                "FRONTED-MEEK-HTTP-OSSH",
+                "QUIC-OSSH",
+            ],
         }
         with open(self.config_path, 'w') as f:
             json.dump(config, f, indent=2)
