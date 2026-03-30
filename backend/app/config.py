@@ -1,4 +1,5 @@
 import os
+import secrets
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -8,7 +9,7 @@ load_dotenv()
 class Settings(BaseSettings):
     # App
     APP_NAME: str = "MegaTransfer"
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "super-secret-key-change-in-production-2024")
+    SECRET_KEY: str = os.getenv("SECRET_KEY", secrets.token_urlsafe(64))
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
 
@@ -37,9 +38,9 @@ class Settings(BaseSettings):
     # Download portal base URL
     PORTAL_BASE_URL: str = os.getenv("PORTAL_BASE_URL", "http://localhost:5173")
 
-    # Admin credentials (first admin)
-    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "admin@bytecare.shop")
-    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
+    # Admin credentials (first admin) — MUST be set via env vars in production
+    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
 
     class Config:
         env_file = ".env"

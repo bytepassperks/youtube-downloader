@@ -35,22 +35,25 @@ async def startup():
     _cleanup_disk_before_db()
 
     init_db()
-    # Create or update default admin
+    # Create or update default admin (skip if env vars not configured)
     conn = get_connection()
-    admin = conn.execute("SELECT id FROM users WHERE email = ?", (app_settings.ADMIN_EMAIL,)).fetchone()
-    hashed = get_password_hash(app_settings.ADMIN_PASSWORD)
-    if not admin:
-        conn.execute(
-            "INSERT INTO users (email, hashed_password, is_admin) VALUES (?, ?, 1)",
-            (app_settings.ADMIN_EMAIL, hashed),
-        )
+    if app_settings.ADMIN_EMAIL and app_settings.ADMIN_PASSWORD:
+        admin = conn.execute("SELECT id FROM users WHERE email = ?", (app_settings.ADMIN_EMAIL,)).fetchone()
+        hashed = get_password_hash(app_settings.ADMIN_PASSWORD)
+        if not admin:
+            conn.execute(
+                "INSERT INTO users (email, hashed_password, is_admin) VALUES (?, ?, 1)",
+                (app_settings.ADMIN_EMAIL, hashed),
+            )
+        else:
+            # Always update admin password to match env var
+            conn.execute(
+                "UPDATE users SET hashed_password = ? WHERE email = ?",
+                (hashed, app_settings.ADMIN_EMAIL),
+            )
+        conn.commit()
     else:
-        # Always update admin password to match env var
-        conn.execute(
-            "UPDATE users SET hashed_password = ? WHERE email = ?",
-            (hashed, app_settings.ADMIN_EMAIL),
-        )
-    conn.commit()
+        print("[Startup] WARNING: ADMIN_EMAIL or ADMIN_PASSWORD not set — skipping admin creation")
 
     # Kill all stale proxy processes from previous deploys
     _kill_stale_processes()
