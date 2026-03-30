@@ -126,7 +126,13 @@ class Uploader:
             endpoint_url=self.settings['idrive_endpoint'],
             aws_access_key_id=self.settings['idrive_access_key'],
             aws_secret_access_key=self.settings['idrive_secret_key'],
-            config=BotoConfig(signature_version='s3v4')
+            config=BotoConfig(
+                signature_version='s3v4',
+                connect_timeout=30,
+                read_timeout=300,
+                retries={'max_attempts': 3, 'mode': 'adaptive'},
+                max_pool_connections=20,
+            )
         )
         self.log("S3 client initialized")
 
@@ -186,92 +192,120 @@ class Uploader:
             self.log(f"  Could not check existing S3 files: {e}")
         return uploaded
 
+    def _upload_part_with_retry(self, s3_key, upload_id, part_num, data, rel_path, max_retries=3):
+        """Upload a single multipart part with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                part = self.s3_client.upload_part(
+                    Bucket=self.settings['idrive_bucket'],
+                    Key=s3_key, UploadId=upload_id,
+                    PartNumber=part_num, Body=data)
+                return part
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)
+                    self.log(f"  [{rel_path}] Part {part_num} failed (attempt {attempt+1}), retrying in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                else:
+                    raise
+
     def _upload_file(self, local_path, s3_key, file_size, file_idx):
-        """Upload a single file to S3."""
+        """Upload a single file to S3 with retry logic."""
         if self._cancelled:
             return False
 
         rel_path = s3_key.split('/', 1)[1] if '/' in s3_key else s3_key
         size_mb = file_size / 1024 / 1024
+        max_file_retries = 3
 
-        try:
-            start = time.time()
+        for file_attempt in range(max_file_retries):
+            if self._cancelled:
+                return False
 
-            if file_size > 100 * 1024 * 1024:  # >100 MB: multipart
-                chunk_size = 64 * 1024 * 1024  # 64 MB parts
-                mpu = self.s3_client.create_multipart_upload(
-                    Bucket=self.settings['idrive_bucket'], Key=s3_key)
-                upload_id = mpu['UploadId']
+            try:
+                start = time.time()
 
-                try:
-                    parts = []
-                    part_num = 1
-                    uploaded_bytes = 0
+                if file_size > 16 * 1024 * 1024:  # >16 MB: multipart
+                    chunk_size = 16 * 1024 * 1024  # 16 MB parts (smaller for iDrive compatibility)
+                    mpu = self.s3_client.create_multipart_upload(
+                        Bucket=self.settings['idrive_bucket'], Key=s3_key)
+                    upload_id = mpu['UploadId']
 
-                    with open(local_path, 'rb') as f:
-                        while True:
-                            if self._cancelled:
-                                self.s3_client.abort_multipart_upload(
-                                    Bucket=self.settings['idrive_bucket'],
-                                    Key=s3_key, UploadId=upload_id)
-                                return False
-
-                            data = f.read(chunk_size)
-                            if not data:
-                                break
-
-                            part = self.s3_client.upload_part(
-                                Bucket=self.settings['idrive_bucket'],
-                                Key=s3_key, UploadId=upload_id,
-                                PartNumber=part_num, Body=data)
-                            parts.append({'ETag': part['ETag'], 'PartNumber': part_num})
-                            uploaded_bytes += len(data)
-                            part_num += 1
-
-                            pct = uploaded_bytes * 100 // file_size
-                            elapsed = time.time() - start
-                            speed = uploaded_bytes / elapsed if elapsed > 0 else 0
-                            self.log(f"  [{file_idx}] {rel_path}: {pct}% ({speed/1024/1024:.1f} MB/s)")
-
-                    self.s3_client.complete_multipart_upload(
-                        Bucket=self.settings['idrive_bucket'], Key=s3_key,
-                        UploadId=upload_id,
-                        MultipartUpload={'Parts': parts})
-
-                except Exception:
                     try:
-                        self.s3_client.abort_multipart_upload(
-                            Bucket=self.settings['idrive_bucket'],
-                            Key=s3_key, UploadId=upload_id)
-                    except Exception:
-                        pass
-                    raise
+                        parts = []
+                        part_num = 1
+                        uploaded_bytes = 0
 
-            else:  # Small file: direct upload
-                with open(local_path, 'rb') as f:
+                        with open(local_path, 'rb') as f:
+                            while True:
+                                if self._cancelled:
+                                    self.s3_client.abort_multipart_upload(
+                                        Bucket=self.settings['idrive_bucket'],
+                                        Key=s3_key, UploadId=upload_id)
+                                    return False
+
+                                data = f.read(chunk_size)
+                                if not data:
+                                    break
+
+                                part = self._upload_part_with_retry(
+                                    s3_key, upload_id, part_num, data, rel_path)
+                                parts.append({'ETag': part['ETag'], 'PartNumber': part_num})
+                                uploaded_bytes += len(data)
+                                part_num += 1
+
+                                pct = uploaded_bytes * 100 // file_size
+                                elapsed = time.time() - start
+                                speed = uploaded_bytes / elapsed if elapsed > 0 else 0
+                                self.log(f"  [{file_idx}] {rel_path}: {pct}% ({speed/1024/1024:.1f} MB/s)")
+
+                        self.s3_client.complete_multipart_upload(
+                            Bucket=self.settings['idrive_bucket'], Key=s3_key,
+                            UploadId=upload_id,
+                            MultipartUpload={'Parts': parts})
+
+                    except Exception:
+                        try:
+                            self.s3_client.abort_multipart_upload(
+                                Bucket=self.settings['idrive_bucket'],
+                                Key=s3_key, UploadId=upload_id)
+                        except Exception:
+                            pass
+                        raise
+
+                else:  # Small file: direct upload with retry
+                    with open(local_path, 'rb') as f:
+                        file_data = f.read()
                     self.s3_client.put_object(
                         Bucket=self.settings['idrive_bucket'],
-                        Key=s3_key, Body=f)
+                        Key=s3_key, Body=file_data)
 
-            elapsed = time.time() - start
-            speed = file_size / elapsed if elapsed > 0 else 0
+                elapsed = time.time() - start
+                speed = file_size / elapsed if elapsed > 0 else 0
 
-            with self._lock:
-                self._files_done += 1
-                self._total_uploaded += file_size
-                done = self._files_done
-                total = self._total_files
+                with self._lock:
+                    self._files_done += 1
+                    self._total_uploaded += file_size
+                    done = self._files_done
+                    total = self._total_files
 
-            self.log(f"  [{done}/{total}] {rel_path} ({size_mb:.1f} MB, {speed/1024/1024:.1f} MB/s)")
+                self.log(f"  [{done}/{total}] {rel_path} ({size_mb:.1f} MB, {speed/1024/1024:.1f} MB/s)")
 
-            if self.progress_callback:
-                self.progress_callback(done, total, rel_path)
+                if self.progress_callback:
+                    self.progress_callback(done, total, rel_path)
 
-            return True
+                return True
 
-        except Exception as e:
-            self.log(f"  [FAIL] {rel_path}: {e}")
-            return False
+            except Exception as e:
+                if file_attempt < max_file_retries - 1:
+                    wait_time = 10 * (file_attempt + 1)
+                    self.log(f"  [RETRY] {rel_path}: attempt {file_attempt+1} failed, retrying in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                else:
+                    self.log(f"  [FAIL] {rel_path}: {e} (after {max_file_retries} attempts)")
+                    return False
+
+        return False
 
     def run(self, folder_path, s3_prefix=None):
         """Main upload flow."""
